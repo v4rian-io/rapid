@@ -1,0 +1,17 @@
+# rapid policy, gates and limits. One key=value per line; a key set twice is
+# refused. Land always applies the conf committed on dev, so a change here
+# reaches every branch only after it lands through a branch of its own.
+land_who=anyone
+land_list=
+max_commits=20
+# The token of the requirement IDs (RAPID-R-<slug>) in the register rapid check --reqs prints.
+reqs_id=RAPID
+# Gates: one shell command each, run from the tree root; exit 0 passes. The
+# lints (no quiet grep in a pipeline, no personal data) run before the matrix.
+gates_fast=sh .rapid/lint/run.sh && sh .rapid/tests/run.sh --fast
+gates_full=sh .rapid/lint/run.sh && sh .rapid/tests/run.sh
+gates_release=sh .rapid/lint/run.sh && sh .rapid/tests/run.sh
+# Run by rapid land on the own tree of every merge of the batch, all at once: each
+# merge parses, prints its help and passes the lints (the test that every point runs).
+gates_each=sh .rapid/tests/smoke.sh
+requirement_test=required

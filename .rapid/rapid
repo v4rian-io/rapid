@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# rapid - software development lifecycle tool: branches in, one merge out, history as the database.
+#
+# Usage:
+#   rapid status [--json]                where you are, open branches, last version
+#   rapid -h | --help
+#
+# kinds: feature fix r&d refactor docs test. names: a-z, 0-9 and -, 2 to 48 chars.
+# Policy, gates and limits live in .rapid/conf (see lib/policy.sh); land always
+# applies the conf committed on dev, never the branch's own copy.
+# main is production: publishing is a release reaching main, and by default only
+# the owner, an admin listed in .rapid/admins, promotes dev to main (rapid release;
+# release_who=list with release_list names others). dev is
+# integration: rapid land --batch lands into the open batch and defers its
+# close, rapid land closes the batch; pushing dev, branches or tags to a
+# remote is transport, never publishing.
+#
+# Exit codes: 0 done, 1 refused or failed (the reason is printed), 2 usage,
+# 3 land --pr is waiting for approvals, or the forge has not accepted a release merge yet,
+# 4 land met a conflict rebasing the branch onto dev (the branch is left as it was).
+set -euo pipefail
+
+# rapid may run through a link (rapid setup --install): its libraries stand beside the file itself
+_rs="${BASH_SOURCE[0]}"
+while [ -L "$_rs" ]; do
+  _rl=$(readlink "$_rs"); case "$_rl" in /*) _rs="$_rl" ;; *) _rs="$(dirname "$_rs")/$_rl" ;; esac
+done
+RAPID_SELF="$(cd "$(dirname "$_rs")" && pwd)"; unset _rs _rl
+# installed mode (lib/pin.sh): a repository that pins another version of rapid is served by it
+if [ -f "$RAPID_SELF/lib/pin.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$RAPID_SELF/lib/pin.sh"
+  case "${1:-}" in
+    -h|--help|"") ;;
+    # the installed rapid moves the pin itself: the pinned version may predate the verb
+    upgrade) ;;
+  esac
+fi
+# a land is checked by dev's framework, never by the branch's own copy (lib/devexec.sh)
+if [ "${1:-}" = land ]; then
+  . "$RAPID_SELF/lib/devexec.sh"; rapid_devexec "$RAPID_SELF" rapid "$@"
+fi
+# shellcheck source=/dev/null
+. "$RAPID_SELF/lib/core.sh"
+for _l in "$RAPID_SELF"/lib/*.sh; do
+  # the core is loaded; devexec is a program of its own
+  case "${_l##*/}" in core.sh|devexec.sh) continue ;; esac
+  # shellcheck source=/dev/null
+  . "$_l"
+done
+unset _l
+
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit "${1:-0}"; }
+# usage_verb VERB: the usage lines of one verb (and their continuations).
+usage_verb() {
+  awk -v v="$1" 'NR > 1 && /^#/ { sub(/^# ?/, "")
+      if ($0 ~ "^  rapid " v "( |$)") { on = 1; print; next }
+      if (on && $0 ~ /^   +[^ ]/ && $0 !~ /^  rapid /) { print; next }
+      on = 0; next }
+    NR > 1 { exit }' "$0"
+  exit 0
+}
+
+# _not_landed: every branch dev does not hold, here or on origin as last
+# fetched, one name per line: a branch never landed stays a branch, its anchor
+# kept forever, and status and doctor list it.
+_not_landed() {
+  local r n
+  git rev-parse -q --verify refs/heads/dev >/dev/null || return 0
+  # shellcheck disable=SC2086
+  git for-each-ref --format='%(refname)' $RAPID_POOL_NS refs/remotes/origin/pool | while read -r r; do
+    git merge-base --is-ancestor "$r" dev 2>/dev/null && continue
+    n="${r#refs/heads/}"; n="${n#refs/remotes/origin/}"; printf '%s\n' "$n"
+  done | sort -u
+  return 0
+}
+
+# _landed_live: origin's branches that dev already holds (landed, not yet deleted),
+# one per line; empty without origin or when it is unreachable.
+_landed_live() {
+  rapid_has_remote || return 0
+  local sha ref d
+  d=$(git rev-parse -q --verify refs/remotes/origin/dev || git rev-parse -q --verify refs/heads/dev) || return 0
+  git ls-remote origin 'refs/heads/pool/*' 2>/dev/null | while read -r sha ref; do
+    git cat-file -e "$sha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$sha" "$d" 2>/dev/null && printf '%s\n' "${ref#refs/heads/}"
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- status
+cmd_status() {
+  local root b v rel l ahead behind json=false sep="" oa="" ob=""
+  case "${1:-}" in --json) json=true ;; "") ;; *) RAPID_RC=2 rapid_die "status: unknown argument $1" ;; esac
+  root=$(rapid_root); cd "$root"
+  if $json; then
+    b=$(rapid_branch); read -r v rel <<<"$(rapid_version_last dev)"
+    if rapid_has_remote && git rev-parse -q --verify refs/remotes/origin/dev >/dev/null && git rev-parse -q --verify refs/heads/dev >/dev/null; then
+      oa=$(git rev-list --count dev..origin/dev); ob=$(git rev-list --count origin/dev..dev)
+    fi
+    printf '{"branch": "%s", "dev": "%s", "version": "%s", "released": %s, "origin_ahead": %s, "origin_behind": %s, "branches": [' \
+      "$b" "$(git rev-parse dev 2>/dev/null)" "$v" "$([ "$rel" = 1 ] && echo true || echo false)" "${oa:-null}" "${ob:-null}"
+    for l in $(git for-each-ref --format='%(refname:short)' $RAPID_POOL_NS); do
+      printf '%s{"name": "%s", "ahead": %s, "behind": %s}' "$sep" "$l" "$(git rev-list --count "dev..$l")" "$(git rev-list --count "$l..dev")"; sep=", "
+    done
+    return 0
+  fi
+  b=$(rapid_branch)
+  local ns; ns=$(_need_setup)
+  [ -z "$ns" ] || rapid_info "setup: $ns; run 'rapid setup'"
+  read -r v rel <<<"$(rapid_version_last dev)"
+  rapid_info "branch: ${b:-detached at $(git rev-parse --short HEAD)}"
+  rapid_info "dev: $(git rev-parse --short dev 2>/dev/null || echo none), last version ${v:-none}$([ "$rel" = 1 ] && echo ' (released)')"
+  if rapid_has_remote && git rev-parse -q --verify refs/remotes/origin/dev >/dev/null && git rev-parse -q --verify refs/heads/dev >/dev/null; then
+    rapid_info "origin/dev: $(git rev-list --count dev..origin/dev) ahead, $(git rev-list --count origin/dev..dev) behind local dev (as last fetched)"
+  fi
+  rapid_info "open branches:"
+  for l in $(git for-each-ref --format='%(refname:short)' $RAPID_POOL_NS); do
+    ahead=$(git rev-list --count "dev..$l"); behind=$(git rev-list --count "$l..dev")
+    rapid_info "  $l  $ahead commit(s), $behind behind dev$([ "$l" = "$b" ] && echo '  <- here')"
+  done
+  local ul; ul=$(_not_landed)
+  [ -z "$ul" ] || rapid_info "branches not landed yet: $(tr '\n' ' ' <<<"$ul")"
+  local ll; ll=$(_landed_live)
+  [ -z "$ll" ] || rapid_info "landed, still on origin (an admin deletes them with rapid branch --delete-landed): $(tr '\n' ' ' <<<"$ll")"
+}
+
+# A clone that never ran rapid setup has no hooks and maybe no dev: the verbs
+# that write (branch, commit, land, sync, release) refuse with the one command to run,
+# instead of working unguarded or failing with a raw git error. check, bisect
+# and doctor stay usable without it (the forge workflow runs them on a
+# runner that has no hooks); status says what is missing.
+_need_setup() {
+  local hp; hp=$(git config --get core.hooksPath 2>/dev/null || true)
+  git rev-parse -q --verify refs/heads/dev >/dev/null || { echo "this clone has no dev branch"; return 0; }
+}
+
+case "${2:-}" in -h|--help) case "${1:-}" in setup|branch|check|commit|land|sync|release|bisect|status|doctor|changelog|version|queue|hook|upgrade) usage_verb "$1" ;; esac ;; esac
+case "${1:-}" in
+  branch|land|sync|release|commit|upgrade)
+    if git rev-parse --git-dir >/dev/null 2>&1; then
+      _ns=$(cd "$(rapid_root)" && _need_setup)
+      [ -z "$_ns" ] || rapid_die "$_ns; run 'rapid setup' first (.rapid/rapid setup)"
+    fi ;;
+esac
+case "${1:-}" in
+  status) shift; cmd_status "$@" ;;
+  -h|--help) usage 0 ;;
+  *) usage 2 ;;
+esac

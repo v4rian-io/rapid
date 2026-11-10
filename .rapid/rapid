@@ -2,6 +2,9 @@
 # rapid - software development lifecycle tool: branches in, one merge out, history as the database.
 #
 # Usage:
+#   rapid setup                          activate hooks, seed main and dev; the human runner is the first admin
+#   rapid setup --require-test          the first setup writes requirement_test=required: every branch states
+#                                      its requirement and its test (later: a [MODE] change of .rapid/conf)
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid -h | --help
 #
@@ -59,6 +62,134 @@ usage_verb() {
       on = 0; next }
     NR > 1 { exit }' "$0"
   exit 0
+}
+
+# _setup_first: 0 at the first setup of a repository: it has no commit, or it has commits but
+# no seed (no committed .rapid/ and no dev here or on origin), which the seed commit then
+# goes on top of.
+_setup_first() {
+  git rev-parse -q --verify HEAD >/dev/null || return 0
+  ! git cat-file -e HEAD:.rapid 2>/dev/null && ! git rev-parse -q --verify refs/heads/dev >/dev/null \
+    && ! git rev-parse -q --verify refs/remotes/origin/dev >/dev/null
+}
+
+# _setup_conf_write: the conf of the first setup, before the seed commit takes it. A
+# repository with no .rapid/conf gets one that says gates_full=none out loud (a land
+# refuses an unset gates_full), so the defaults land; rapid setup --require-test adds
+# requirement_test=required. Only the first setup writes: in a seeded repository the
+# conf changes by an admin's [MODE] commit.
+_setup_conf_write() {
+  if ! _setup_first; then
+    [ "${_setup_reqtest:-0}" = 0 ] \
+      || rapid_die "setup --require-test sets requirement_test at the first setup only; this repository is seeded, so an admin lands requirement_test=required in a [MODE] commit of .rapid/conf"
+    return 0
+  fi
+  if [ ! -f .rapid/conf ]; then
+    printf '# .rapid/conf: one key=value per line (MANUAL.md, section 3).\n# No gate is set yet: name your test command here, one shell command, exit 0 passes.\ngates_full=none\n' > .rapid/conf
+    rapid_info "conf: .rapid/conf written with gates_full=none (no gate runs until you name one there)"
+  fi
+  [ "${_setup_reqtest:-0}" = 1 ] || return 0
+  local have; have=$(RAPID_CONF_REV="" rapid_conf requirement_test "")
+  case "$have" in
+    required) ;;
+    "") printf 'requirement_test=required\n' >> .rapid/conf; rapid_info "conf: requirement_test=required (every branch states its requirement and its test)" ;;
+    *) rapid_die "setup --require-test: .rapid/conf already sets requirement_test=$have; change that line" ;;
+  esac
+}
+
+cmd_setup() {
+  case "${1:-}" in
+    "") ;;
+    *) RAPID_RC=2 rapid_die "setup: unknown argument $1" ;;
+  esac
+  local root email tree root_c
+  root=$(rapid_root); cd "$root"
+  # the admins are this working copy's own configuration: excluded by default (an admin may commit them)
+  # the framework's own repository (it holds .rapid/rapid) is seeded before its own branches
+  # bring the files its gates name; anywhere else a gate naming a missing file is refused
+  local miss=""; [ -f .rapid/rapid ] || miss=$(RAPID_CONF_REV="" rapid_gate_missing "$root")
+  if [ -n "$miss" ]; then
+    printf '%s\n' "$miss" | sed 's/^/  /' >&2
+    rapid_die "set your own gates in .rapid/conf first (gates_fast, gates_full, gates_release: one shell command each, exit 0 passes; gates_full=none lands without a full gate)"
+  fi
+  email=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -E 's/.*<([^>]*)>.*/\1/') || email=""
+  local uname; uname=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -E 's/^(.*) <[^>]*>.*$/\1/') || uname=""
+  _setup_conf_write
+  # main is production and the admins alone promote dev to main and flip policy: every
+  # setup of a working copy that names no admin yet names the setup author (never an
+  # agent), from git's user.email and user.name; the file stays in this working copy only
+  if [ ! -f .rapid/admins ]; then
+    if RAPID_CONF_REV="" rapid_agent_session >/dev/null; then
+      rapid_warn "the setup author is an agent, so no admin is written; rapid setup --owner EMAIL names the owner"
+    else
+      printf '# Admins: one email per line. They alone change .rapid/conf, in [MODE] commits, and release. This file stays in this working copy unless an admin commits it.\n%s\n' "$email${uname:+ # $uname}" > .rapid/admins
+      rapid_info "admin: $email${uname:+ ($uname)} (the admins flip policy in [MODE] commits and promote dev to main)"
+    fi
+  fi
+  if _setup_first; then
+    local par=() ix
+    if git rev-parse -q --verify HEAD >/dev/null; then
+      # a repository with commits: they stay main (where main is missing, main is HEAD), and the
+      # seed is their child on dev, the .rapid directory added to HEAD's tree
+      ix=$(rapid_tmpdir seed)
+      GIT_INDEX_FILE="$ix/index" git read-tree HEAD
+      GIT_INDEX_FILE="$ix/index" git add -- .rapid
+      tree=$(GIT_INDEX_FILE="$ix/index" git write-tree); rm -rf "$ix"; par=(-p HEAD)
+    else
+      git add -- .rapid
+      tree=$(git write-tree)
+    fi
+    root_c=$(printf '[NEW] Seed the rapid workflow\n\nRoot commit: the .rapid directory as it stands, before any branch.\n' | git commit-tree "$tree" ${par[@]+"${par[@]}"})
+    if [ ${#par[@]} = 0 ]; then
+      git update-ref refs/heads/main "$root_c"
+      git symbolic-ref HEAD refs/heads/main
+      git reset -q
+      rapid_info "seeded main at $(git rev-parse --short "$root_c")"
+    else
+      git rev-parse -q --verify refs/heads/main >/dev/null || git branch main HEAD
+      git update-ref refs/heads/dev "$root_c"
+      git symbolic-ref HEAD refs/heads/dev
+      git reset -q
+      rapid_info "seeded dev at $(git rev-parse --short "$root_c")"
+    fi
+  fi
+  if ! git rev-parse -q --verify refs/heads/main >/dev/null; then
+    # a clone that checked out another branch holds no main of its own: it is the main of origin
+    # with no main anywhere it is the seed of dev: main holds the seed or a release merge, never a tip of dev
+    if git rev-parse -q --verify refs/remotes/origin/main >/dev/null; then git branch -q main refs/remotes/origin/main
+    elif git rev-parse -q --verify refs/heads/dev >/dev/null; then git branch main "$(rapid_dev_root refs/heads/dev)"
+    else git branch main HEAD; fi
+  fi
+  if ! git rev-parse -q --verify refs/heads/dev >/dev/null; then
+    # a clone that checked out main holds no dev of its own: it is the dev of origin
+    if git rev-parse -q --verify refs/remotes/origin/dev >/dev/null; then git branch -q dev refs/remotes/origin/dev
+    else
+      git branch dev main
+      rapid_info "created dev at main"
+    fi
+  fi
+  if rapid_has_remote; then
+    local need=""
+    git ls-remote --exit-code origin refs/heads/main >/dev/null 2>&1 || need="$need main"
+    git ls-remote --exit-code origin refs/heads/dev >/dev/null 2>&1 || need="$need dev"
+    if [ -n "$need" ]; then
+      # Seeding never advances main: main goes up only where it is. When dev
+      # goes up it carries every tag it holds, so pre-push sees each merge
+      # with its tag (an existing history seeds in one atomic push).
+      local tags="" t
+      if [[ " $need " == *" dev "* ]]; then
+        for t in $(git tag --merged dev); do
+          tags="$tags refs/tags/$t:refs/tags/$t"
+        done
+      fi
+      # shellcheck disable=SC2086
+      # the gate log goes with dev: a deferred test record is shown by the close record it holds
+      if [[ " $need " == *" dev "* ]] && git rev-parse -q --verify refs/notes/gates >/dev/null; then tags="$tags refs/notes/gates:refs/notes/gates"; fi
+      # shellcheck disable=SC2086
+      git push -q --atomic origin $need $tags || rapid_die "origin refused the push; nothing was published"
+      rapid_info "seeded origin with:$need${tags:+ plus the tags on dev}"
+    fi
+  fi
 }
 
 # _not_landed: every branch dev does not hold, here or on origin as last
@@ -143,6 +274,7 @@ case "${1:-}" in
     fi ;;
 esac
 case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
   status) shift; cmd_status "$@" ;;
   -h|--help) usage 0 ;;
   *) usage 2 ;;

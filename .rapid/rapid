@@ -5,6 +5,13 @@
 #   rapid setup                          activate hooks, seed main and dev; the human runner is the first admin
 #   rapid setup --require-test          the first setup writes requirement_test=required: every branch states
 #                                      its requirement and its test (later: a [MODE] change of .rapid/conf)
+#   rapid branch <kind> <name> [-r TEXT] [--test PATH] [--ticket ID]
+#                                      start pool/v<series>/n<N>.<kind>.<name> at dev (n<N>: its number, creation
+#                                      ordered, never shared, online or offline); .rapid/requirements/<name>.md is
+#                                      written when -r, --test or --ticket states something, always under
+#                                      requirement_test=required
+#                                      (--test: the test file or scenario name that verifies it, as its Test: line);
+#                                      it also writes the safety anchor safety/v<series>/n<N>.<kind>.<name> (kept forever)
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid -h | --help
 #
@@ -192,6 +199,155 @@ cmd_setup() {
   fi
 }
 
+# ---------------------------------------------------------------- branch
+_slug_taken() {
+  local slug="$1" ns="$RAPID_POOL_NS"
+  git log --first-parent --format=%s dev 2>/dev/null | grep -E "^\[MERGE\] pool/[^ ]*[.]$slug into dev: " >/dev/null && return 0
+  rapid_has_remote && ns="$ns refs/remotes/origin/pool"
+  # shellcheck disable=SC2086
+  git for-each-ref --format='%(refname)' $ns | sed -E "s#.*/##; s/^$RAPID_NUM_RE[.]//; s/^[a-z]+[.]//" | grep -Fx -- "$slug" >/dev/null && return 0
+  return 1
+}
+
+# _number_max: the highest N this clone knows of (lib/core.sh, branch numbers):
+# the Branch-Number of dev's merges, every safety anchor (this clone's and
+# origin's as last fetched) and every branch name; never below the count of
+# merges on dev, since each branch landed before numbers spent one.
+_number_max() {
+  local m c
+  m=$( { git log --first-parent --format='%(trailers:key=Branch-Number,valueonly)' dev 2>/dev/null || true
+         git for-each-ref --format='%(refname)' refs/heads/safety refs/rapid/origin-safety $RAPID_POOL_NS \
+           refs/remotes/origin/pool | sed 's#.*/##'
+       } | sed -nE 's/^n([0-9]+)([.].*)?$/\1/p' | sort -n | tail -n 1)
+  c=$(git rev-list --first-parent --merges --count dev 2>/dev/null || echo 0)
+  if [ -n "$m" ] && [ "$m" -ge "$c" ]; then printf '%s' "$m"; else printf '%s' "$c"; fi
+}
+
+# _number_take KIND NAME FORK [ANCHOR]: take the next branch number and print
+# it. Without ANCHOR a new branch's anchor <kind>/<number>.<name> is written at
+# FORK: the anchor carries the number. With ANCHOR (the anchor of a branch made
+# by hand, whose name carries no number) nothing is written: the number goes
+# into the merge of the land that asks for it. Nothing is pushed here: opening
+# a branch never reaches origin. The anchors origin holds are counted when it
+# answers; counting and writing the anchor are one step for the work trees of
+# this clone, so two of them never share a number.
+_number_take() {
+  local kind="$1" slug="$2" fork="$3" have="${4:-}" n num obj name lock tries=0
+  if rapid_has_remote && [ "$RAPID_OFFLINE" != 1 ]; then
+    git fetch -q --no-tags origin '+refs/heads/safety/*:refs/rapid/origin-safety/*' 2>/dev/null || true
+  fi
+  lock="$(git rev-parse --git-common-dir)/rapid/number.lock"; mkdir -p "${lock%/*}"
+  # the lock is a file holding this pid, made in one step (noclobber); a holder that is gone is lifted
+  until ( set -C; printf '%s\n' "$$" > "$lock" ) 2>/dev/null; do
+    rapid_lock_lift "$lock" "rapid branch" && continue
+    tries=$((tries + 1)); [ "$tries" -le 20 ] || rapid_die "could not reserve a branch number in 20 tries; run rapid branch again"
+    sleep 1
+  done
+  n=$(( $(_number_max) + 1 )); num="n$n"
+  if [ -z "$have" ]; then
+    name=$(rapid_branch_name "$kind" "$slug" "$num" "${RAPID_POOL_SERIES:-}"); name="${name#pool/}"
+    obj=$(rapid_anchor_commit "$name" "$fork")
+    git update-ref "refs/heads/safety/$name" "$obj" "$RAPID_ZERO" || { rm -f "$lock"; rapid_die "could not write the anchor safety/$name"; }
+  fi
+  rm -f "$lock"
+  printf '%s' "$num"
+}
+
+# _branch_renumber_taken BRANCH KIND NAME: a number is taken in the clone when its branch
+# opens (nothing is pushed), so another clone may publish the same number first.
+# When origin holds a safety anchor that carries BRANCH's number for another branch,
+# BRANCH, never pushed, takes the next free number here: its branch and its anchor
+# move to the new name. Prints the branch's name, new or unchanged. rapid sync and
+# rapid land call it; the close refuses a number that is taken after the land.
+_branch_renumber_taken() {
+  local branch="$1" kind="$2" slug="$3" num own theirs fork nn new ser oan
+  num=$(rapid_branch_number "$branch"); oan=$(rapid_anchor_ref "$branch")
+  own=""; [ -z "$num" ] || own=$(git rev-parse -q --verify "$oan" || true)
+  if [ -z "$own" ] || ! rapid_has_remote; then printf '%s' "$branch"; return 0; fi
+  # an anchor of origin with this number, another name, another anchor commit: another branch
+  # (a renamed branch keeps its anchor commit under the new name)
+  theirs=$(git ls-remote origin "refs/heads/safety/*/$num.*" 2>/dev/null | awk -v a="$oan" -v o="$own" '$2 != a && $1 != o { print $2; exit }' || true)
+  if [ -z "$theirs" ]; then printf '%s' "$branch"; return 0; fi
+  fork=$(git rev-parse -q --verify "$oan^1" || git merge-base dev "$branch")
+  ser=$(printf '%s' "$branch" | cut -d/ -f2)
+  # this clone's anchor under the number was never published: it goes, the branch counts again
+  nn=$(RAPID_POOL_SERIES="$ser" _number_take "$kind" "$slug" "$fork")
+  new="pool/$ser/$nn.$kind.$slug"
+  git branch -m "$branch" "$new"
+  git update-ref -d "$oan" 2>/dev/null || true
+  rapid_info "branch number $num was published by another clone first; $branch is now $new" >&2
+  printf '%s' "$new"
+}
+
+# _branch_number_of BRANCH: the number BRANCH's name carries, checked to be this branch's
+# alone: no other safety anchor carries it, no merge of dev landed another branch under
+# it. Empty for a branch whose name carries none (made by hand): its land takes one.
+_branch_number_of() {
+  local branch="$1" num an o other
+  an=$(rapid_anchor_ref "$branch")
+  num=$(rapid_branch_number "$branch")
+  [ -n "$num" ] || return 0
+  rapid_anchor_make "$branch" "$(git merge-base dev "$branch" 2>/dev/null || git rev-parse "$branch")" >/dev/null
+  o=$(git rev-parse -q --verify "$an" || true)
+  other=$(git for-each-ref --format='%(objectname) %(refname)' refs/heads/safety refs/rapid/origin-safety \
+    | awk -v o="$o" -v n="$num." '{ b = $2; sub(/.*\//, "", b) } index(b, n) == 1 && $1 != o { print b; exit }')
+  [ -n "$other" ] || other=$(git log --first-parent --format='%(trailers:key=Branch-Number,valueonly,separator=%x2C)%x09%s' dev 2>/dev/null \
+    | awk -F '\t' -v n="$num" -v b="$branch" '$1 == n && index($2, "[MERGE] " b " into dev: ") != 1 { split($2, w, " "); sub(/^.*\//, "", w[2]); print w[2]; exit }')
+  [ -z "$other" ] || rapid_die "$num belongs to another branch ($other); branch numbers are never shared (I7)"
+  printf '%s' "$num"
+}
+
+cmd_branch() {
+  case "${1:-}" in
+    ""|-h|--help) usage 2 ;;
+  esac
+  local kind="$1" slug="${2:-}" req="" ticket="" req_test="" root
+  shift 2 || usage 2
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -r) req="${2:-}"; shift 2 ;;
+      --ticket) ticket="${2:-}"; shift 2 ;;
+      --test) req_test="${2:-}"; [ -n "$req_test" ] || RAPID_RC=2 rapid_die "branch: --test needs a test file or scenario name"; shift 2 ;;
+      *) RAPID_RC=2 rapid_die "branch: unknown argument $1" ;;
+    esac
+  done
+  rapid_kind_ok "$kind" || RAPID_RC=2 rapid_die "kind '$kind' is not one of: $RAPID_KINDS"
+  rapid_slug_ok "$slug" || RAPID_RC=2 rapid_die "name '$slug' must be a-z, 0-9 and -, 2 to 48 chars"
+  root=$(rapid_root); cd "$root"
+  git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit or stash them first"
+  # a work tree that could not follow dev would carry its old files into the branch as staged changes
+  [ -z "$(git status --porcelain --untracked-files=no)" ] \
+    || rapid_die "dev moved under this work tree and it could not follow (see above); catch it up, then rapid branch again"
+  _slug_taken "$slug" && rapid_die "name '$slug' is already used by a branch, landed or not (I7); pick another"
+  local tk=""
+  if [ -n "$ticket" ]; then
+    rapid_tracker >/dev/null   # refuses a misconfigured tracker here, in this shell
+    tk=$(rapid_tracker_call get "$ticket" || true)
+    [ -n "$req" ] || req=$(rapid_json_str "$tk" title)
+  fi
+  # the branch's number (creation order, never shared) and its fork point, kept forever
+  local num; num=$(_number_take "$kind" "$slug" dev)
+  local pn; pn=$(rapid_branch_name "$kind" "$slug" "$num")
+  git switch -q -c "$pn" dev
+  # the requirement file: always under requirement_test=required; else only when the branch
+  # states something (-r, --test, --ticket), so no placeholder stands in the way of a commit
+  local rnote="no requirement file (requirement_test=optional; -r states one)"
+  if [ "$(rapid_conf requirement_test optional)" = required ] || [ -n "$req" ] || [ -n "$req_test" ] || [ -n "$ticket" ]; then
+    mkdir -p "$RAPID_REQ_DIR"
+    {
+      printf '# %s/%s\n\n' "$kind" "$slug"
+      printf '%s\n' "${req:-$RAPID_REQ_PLACEHOLDER}"
+      [ -z "$ticket" ] || printf '\nTicket: %s\n' "$ticket"
+      [ -z "$req_test" ] || printf '\nTest: %s\n' "$req_test"
+    } > "$RAPID_REQ_DIR/$slug.md"
+    git add -- "$RAPID_REQ_DIR/$slug.md"
+    rnote="$RAPID_REQ_DIR/$slug.md is staged with your first commit"
+  fi
+  [ -z "$ticket" ] || rapid_tracker_call link "$ticket" --branch "$pn" >/dev/null || true
+  rapid_info "$pn started at dev ($(git rev-parse --short dev)), anchored at safety/${pn#pool/}; nothing is pushed; $rnote"
+}
+
 # _not_landed: every branch dev does not hold, here or on origin as last
 # fetched, one name per line: a branch never landed stays a branch, its anchor
 # kept forever, and status and doctor list it.
@@ -275,6 +431,7 @@ case "${1:-}" in
 esac
 case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
+  branch) shift; cmd_branch "$@" ;;
   status) shift; cmd_status "$@" ;;
   -h|--help) usage 0 ;;
   *) usage 2 ;;

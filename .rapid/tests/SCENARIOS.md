@@ -5,6 +5,7 @@ Run: `sh .rapid/tests/run.sh [--fast] [-j N] [FILTER]` (N at once; default RAPID
 
 | Scenario | Fast | Verifies |
 |---|---|---|
+| batch-close-marker |  | a close removes only its own marker: the marker of a close under test carries that close's own id. An older close that ends while a newer close holds the batch leaves the newer marker in place, publishes nothing in its name and stops, so the newer close alone answers for the batch. |
 | batch-close-one-gate |  | batch-close-one-gate: rapid land runs one gate on the batch's final tree, gates_full, never the |
 | batch-land-local |  | batch-land-local: a plain rapid land always lands into the open batch: five branches land with no gate run and no push, offline; one rapid land gates the final tree and pushes it all in one push; a close with no batch open says so. |
 | batch-land |  | batch landing: rapid land --batch lands each branch exactly as a single land does (its own merge, version tag and test record) but locally and without gates; rapid land gates the final dev tree once and pushes everything in one atomic push. When that gate fails the batch stays: dev, the tags and the branches are kept, the branch that broke the close is named, nothing is pushed (the pre-push guard refuses any push while the batch is open), and rapid land --prune is the rollback. |

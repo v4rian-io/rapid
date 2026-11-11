@@ -25,6 +25,7 @@
 #                                      the same land into the open batch, the close deferred: local, offline,
 #                                      no gate, no push; repeat it for every branch but the last
 #   rapid land [FLAGS] BRANCH...           land each named branch in order; a conflicting one is skipped and named
+#   rapid land --halt                    stop the close under test and keep the batch
 #   rapid land --prune                   put dev back where the batch began and drop the batch, the branches unchanged
 #   rapid land --pr [-F BODY]            open or update the branch's PR (body = the merge body); once it has
 #                                      land_approvals approvals, land it the same way (exit 3 while waiting)
@@ -430,6 +431,300 @@ _body_text() {
       e -= n; while (e > 0 && l[e] ~ /^[[:space:]]*$/) e--
       for (i = 1; i <= e; i++) print l[i] }'
 }
+
+# _batch_close: gate the batch's final dev tree once (gates_full); on a
+# pass publish every merge, tag and ref the batch made in one atomic push, on a
+# failure put local dev back where the batch started and drop its version
+# tags; the branches stay as they were, ready to land again. The gate
+# records go onto the gate log note of the batch's last merge. A push origin
+# refuses keeps the batch (a second close publishes without testing the same
+# tree again); origin's dev moved under the batch puts dev back; an unreachable
+# origin closes the batch locally, for rapid sync --dev to publish.
+# _close_gate_run FILE ID CMD: run the gate of a close as the leader of a process group of
+# its own, on record in FILE as "<pgid> <id>", so the gate and everything under it can be
+# stopped as one group and no pid taken from a list is ever signalled. Job control gives
+# the gate its group: a background job of a shell with set -m leads its own. A gate has
+# no input: it reads /dev/null, so one that reads can never wait on a terminal.
+_close_gate_run() {
+  local g rc=0
+  set -m
+  sh -c "$3" </dev/null &
+  g=$!
+  set +m
+  printf '%s %s\n' "$g" "$2" > "$1"
+  wait "$g" || rc=$?
+  return "$rc"
+}
+
+# _batch_rollback START TIP: put dev back at START, drop the version tags the batch's
+# merges START..TIP made and the vault branches origin never took; the branches stay.
+_batch_rollback() {
+  local start="$1" tip="$2" bf c t bl vr
+  bf="$(git rev-parse --git-common-dir)/rapid/batch"
+  for c in $(git rev-list --first-parent "$start..$tip"); do
+    for t in $(git tag --points-at "$c" 'v*'); do git tag -d "$t" >/dev/null; done
+  done
+  # each branch still holds its tip, and the next land writes its vault again
+  while IFS= read -r bl; do
+    [ -n "$bl" ] || continue
+    vr=$(rapid_vault_ref "$bl")
+    if git rev-parse -q --verify "$vr" >/dev/null && [ -z "$(git ls-remote origin "$vr" 2>/dev/null)" ]; then
+      git update-ref -d "$vr"
+    fi
+  done < "$bf.branches" 2>/dev/null
+  # dev goes back (a fast-forward cannot move a branch backwards): the work tree
+  # that has dev checked out resets to the batch's start, keeping local changes
+  local dwt="" cur="" line
+  while IFS= read -r line; do
+    case "$line" in "worktree "*) cur="${line#worktree }" ;; "branch refs/heads/dev") dwt="$cur" ;; esac
+  done <<<"$(git worktree list --porcelain)"
+  if [ -n "$dwt" ]; then git -C "$dwt" reset -q --keep "$start" || rapid_die "dev is checked out with changes in $dwt that block the move; stash them (git -C $dwt stash), then run the command again"
+  else git update-ref refs/heads/dev "$start" "$tip"; fi
+  rm -f "$bf" "$bf.branches" "$bf.passed" "$bf.gates"
+}
+
+# _close_rec NAME CMD RC T0 LOG: one gate record of a close (the format rapid_gate writes).
+_close_rec() {
+  printf 'gate=%s\ncommand=%s\nexit=%s\nduration=%ss\nat=%s\n' "$1" "$2" "$3" "$(( $(date +%s) - $4 ))" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf -- '--- log tail\n'; rapid_log_tail "$5"
+}
+
+# _close_finish: the batch is closed: each landed branch's branch goes (its tip
+# stays in vault/), as a single land does. Prints the branches it closed.
+_close_finish() {
+  local bf bl branches cur; bf="$(git rev-parse --git-common-dir)/rapid/batch"
+  branches=$(cat "$bf.branches" 2>/dev/null || true)
+  # a close run from a landed branch leaves it for dev, which holds it, so the branch can go
+  cur=$(rapid_branch)
+  if [ -n "$cur" ] && grep -Fx -- "$cur" <<<"$branches" >/dev/null; then git switch -q dev 2>/dev/null || true; fi
+  while IFS= read -r bl; do [ -n "$bl" ] && git branch -q -D "$bl" 2>/dev/null || true; done <<<"$branches"
+  rm -f "$bf" "$bf.branches" "$bf.passed" "$bf.gates" "$bf.publishing"
+  printf '%s\n' "$branches"
+}
+
+# _close_each START TIP: the cheap test of every merge of the batch. gates_each runs on the
+# own tree of each batch merge, all merges at once, each in a private work tree; its record
+# (command, exit code, duration, log tail) joins the gate log of that merge. Prints the
+# version of every merge whose tree fails; nothing when gates_each is unset or none.
+_close_each() {
+  local start="$1" tip="$2" rec="${3:-}" old="${4:-}" cmd m d out pids="" pid bad="" nf merges all
+  cmd=$(rapid_conf gates_each "")
+  if [ -z "$cmd" ] || [ "$cmd" = none ]; then return 0; fi
+  merges=$(git rev-list --reverse --first-parent "$start..$tip")
+  if [ -n "$old" ]; then
+    # --failed-gates-only: a merge the previous close verified on its own tree is not run again
+    all="$merges"; merges=""
+    for m in $all; do
+      if grep -Fx -- "each $m pass" "$old" >/dev/null 2>&1; then printf 'each %s pass\n' "$m" >> "$rec"; else merges="$merges $m"; fi
+    done
+  fi
+  out=$(rapid_tmpdir each)
+  local total; total=$(wc -w <<<"$merges" | tr -d ' ')
+  [ -z "${RAPID_VERBOSE:-}" ] || [ "$total" = 0 ] || printf -- '-> batch gate each on %s merge trees\n' "$total" >&2
+  # the private work trees are made one after another (git adds one work tree at a time);
+  # the gate then runs in all of them at once
+  for m in $merges; do d=$(rapid_private_wt each "$m") && printf '%s\n' "$d" > "$out/$m.wt" || true; done
+  for m in $merges; do
+    ( t0=$(date +%s); rc=0; d=$(cat "$out/$m.wt" 2>/dev/null || true)
+      if [ -n "$d" ]; then
+        (cd "$d" && unset RAPID_CONF_REV RAPID_OFFLINE RAPID_DEVEXEC GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && sh -c "$cmd") > "$out/$m.log" 2>&1 || rc=$?
+        git worktree remove --force "$d" >/dev/null 2>&1 || true
+      else rc=1; echo "no private work tree" > "$out/$m.log"; fi
+      echo "$rc" > "$out/$m.rc"
+      v=$(rapid_version_of "$m" 2>/dev/null || true); [ -n "$v" ] || v=$(git rev-parse --short "$m")
+      [ -z "${RAPID_VERBOSE:-}" ] || rapid_progress "$out" "$total" "   " "each $v $([ "$rc" = 0 ] && echo pass || echo fail) $(( $(date +%s) - t0 ))s"
+      _close_rec each "$cmd" "$rc" "$t0" "$out/$m.log" > "$out/$m" ) &
+    pids="$pids $!"
+  done
+  for pid in $pids; do wait "$pid" 2>/dev/null || true; done
+  for m in $merges; do
+    nf=$(mktemp "${TMPDIR:-/tmp}/rapid-gatelog.XXXXXX")
+    { git notes --ref=gates show "$m" 2>/dev/null || true
+      printf '\nclose of batch %s: gate each on this merge tree %s\n\n' "$(git rev-parse --short "$start")" "$(git rev-parse "$m^{tree}")"
+      cat "$out/$m" 2>/dev/null || true; } > "$nf"
+    git notes --ref=gates add -f -F "$nf" "$m" >/dev/null 2>&1 || true
+    rm -f "$nf"
+    if [ "$(cat "$out/$m.rc" 2>/dev/null || echo 1)" = 0 ]; then
+      [ -z "$rec" ] || printf 'each %s pass\n' "$m" >> "$rec"
+    else
+      [ -z "$rec" ] || printf 'each %s fail\n' "$m" >> "$rec"
+      bad="$bad $(rapid_version_of "$m")"
+    fi
+  done
+  rm -rf "$out"
+  printf '%s' "${bad# }"
+}
+
+# _close_marker_mine FILE ID: 0 when FILE is the marker of the close whose own id is ID
+# (the marker reads "<pid> <tip> <id>"; a missing marker, or another close's, is not).
+_close_marker_mine() {
+  local p t i=""
+  [ -f "$1" ] || return 1
+  read -r p t i < "$1" || true
+  [ -n "$i" ] && [ "$i" = "$2" ]
+}
+
+# _close_marker_drop FILE ID: remove the marker of this close, never the marker a
+# newer close wrote over it.
+_close_marker_drop() { ! _close_marker_mine "$1" "$2" || rm -f "$1"; }
+
+_batch_close() {
+  local only="${1:-}" old=""
+  local root bf start tip wt g cmd rc=0 grec t0 grc
+  root=$(rapid_root); cd "$root"
+  bf="$(git rev-parse --git-common-dir)/rapid/batch"
+  [ -s "$bf" ] || rapid_die "no batch is open; land a branch with rapid land first"
+  start=$(cat "$bf"); tip=$(git rev-parse dev)
+  if [ "$tip" = "$start" ]; then rm -f "$bf" "$bf.branches" "$bf.passed" "$bf.gates"; rapid_info "batch: nothing landed"; return 0; fi
+  export RAPID_CONF_REV="$tip"
+  if [ "$only" = failed ]; then
+    # only the gates the previous close of this batch failed run again; with no such record
+    # the close is refused, never run empty
+    grep -E ' fail$' "$bf.gates" >/dev/null 2>&1 \
+      || rapid_die "land --failed-gates-only: no close of this batch has failed a gate, so there is nothing to run again; run rapid land, which runs every gate"
+    old=$(mktemp "${TMPDIR:-/tmp}/rapid-gates.XXXXXX"); cat "$bf.gates" > "$old"
+    rapid_info "-> batch: only the gates the previous close failed run again: $(sed -nE 's/^([a-z]+) .* fail$/\1/p' "$old" | sort -u | tr '\n' ' ' | sed 's/ $//')"
+  fi
+  if [ "$(cat "$bf.passed" 2>/dev/null || true)" = "$tip" ]; then
+    rapid_info "-> batch: dev $(git rev-parse --short "$tip") already passed its gate; publishing it"
+  else
+    wt=$(rapid_private_wt batch "$tip") || rapid_die "cannot make a private work tree under ${TMPDIR:-/tmp}; nothing changed"
+    grec=$(rapid_tmpdir closerec)
+    # first the cheap test: every merge of the batch starts and lints on its own tree
+    # what each gate of this close did is kept with the batch (batch.gates) for --failed-gates-only
+    : > "$bf.gates"
+    local ebad; ebad=$(_close_each "$start" "$tip" "$bf.gates" "$old")
+    [ -z "$old" ] || rm -f "$old"
+    [ -z "$ebad" ] || { git worktree remove --force "$wt" >/dev/null 2>&1 || true; rm -rf "$grec"
+      rapid_die "the batch gate each fails on the own tree of: $ebad (rapid doctor --verify shows its gate log); nothing was pushed and the batch stays open"; }
+    # a branch that joins the batch while this close tests stops it (rapid land): record who tests what
+    # the marker carries this close's own id, so an older close still running never removes
+    # the marker of a newer one
+    local cid; cid="$$-$(date +%s)-$RANDOM"
+    printf '%s %s %s\n' "$$" "$tip" "$cid" > "$bf.closing"
+    # a close that ends for any reason takes its own gate with it (the gate runs in its own process group)
+    # one gate: gates_full. The fast gate's lint and scenarios are a subset of the full
+    # gate's, so running both tested the same things twice (rapid check --each keeps the
+    # fast gate for single commits).
+    g=full; cmd=$(rapid_conf gates_full "")
+    for g in $g; do
+      # no gate configured is said in the record, never left blank
+      if [ -z "$cmd" ] || [ "$cmd" = none ]; then printf 'gate=%s\nexit=none (no gate configured)\n' "$g" > "$grec/$g"; continue; fi
+      rapid_info "-> batch gate $g on dev $(git rev-parse --short "$tip") ($(git rev-list --first-parent --count "$start..$tip") merges)"
+      t0=$(date +%s)
+      # the gate runs in the private work tree: its group goes on record by an absolute path
+      local gatef; case "$bf" in /*) gatef="$bf.closing.gate" ;; *) gatef="$PWD/$bf.closing.gate" ;; esac
+      { grc=0; (cd "$wt" && export RAPID_TEST_ON_FAIL="${RAPID_TEST_ON_FAIL:-$(rapid_conf test_on_fail "" 2>/dev/null || true)}" && _close_gate_run "$gatef" "$cid" "$cmd") 2>&1 || grc=$?
+        rm -f "$bf.closing.gate"; echo "$grc" > "$grec/$g.rc"; } | tee "$grec/$g.log" || true
+      grc=$(cat "$grec/$g.rc" 2>/dev/null || echo 1)
+      _close_rec "$g" "$cmd" "$grc" "$t0" "$grec/$g.log" > "$grec/$g"
+      [ "$grc" = 0 ] || { rc=1; printf '%s %s fail\n' "$g" "$tip" >> "$bf.gates"; break; }
+      printf '%s %s pass\n' "$g" "$tip" >> "$bf.gates"
+    done
+    _close_marker_mine "$bf.closing" "$cid" || rapid_die "a branch joined the batch during its test, or a newer close took the batch; run rapid land again for the new final tree"
+    _close_marker_drop "$bf.closing" "$cid"
+    [ "$(git rev-parse dev)" = "$tip" ] || rapid_die "dev moved while the batch was tested; run rapid land again"
+    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    if [ "$rc" != 0 ]; then
+      # a failed close keeps the batch: dev, its tags and the branches stay, the branch that broke the close is named,
+      # and the fix lands as one more branch before the next close (the fixer hook test_on_fail
+      # started on each failing scenario the moment it failed)
+      rapid_die "the batch gate $g fails on the final tree; nothing was pushed and the batch stays open: land the fix as one more branch, then rapid land again (rapid land --prune puts dev back at $(git rev-parse --short "$start"))"
+    fi
+    # the batch's one test is the gate log of its last merge, the final tree it ran on
+    local nf; nf=$(mktemp "${TMPDIR:-/tmp}/rapid-gatelog.XXXXXX")
+    { git notes --ref=gates show "$tip" 2>/dev/null || true
+      printf '\nclose of batch %s: gates on the final tree %s\n\n' "$(git rev-parse --short "$start")" "$(git rev-parse "$tip^{tree}")"
+      for g in close full; do [ ! -f "$grec/$g" ] || { cat "$grec/$g"; printf '\n'; }; done; } > "$nf"
+    git notes --ref=gates add -f -F "$nf" "$tip" >/dev/null 2>&1 || rapid_warn "could not write the close's gate log on $(git rev-parse --short "$tip")"
+    rm -f "$nf"; rm -rf "$grec"
+    # this clone closed the batch: pre-push does not run the fast gate again on its merges
+    local pm
+    for pm in $(git rev-list --first-parent "$start..$tip"); do
+      git notes --ref=rapid-close add -f -m "close=$(git rev-parse --short "$start") tree=$(git rev-parse "$pm^{tree}") clone=$(rapid_clone_id)" "$pm" >/dev/null 2>&1 || true
+    done
+    printf '%s\n' "$tip" > "$bf.passed"
+  fi
+  if ! rapid_has_remote; then _close_finish >/dev/null; rapid_info "batch gates pass; no remote, landed locally"; return 0; fi
+  rapid_info "batch gates pass; publishing every merge, tag and ref"
+  # until the push ends no land joins the batch: a land refuses while this close lives
+  printf '%s\n' "$$" > "$bf.publishing"
+  # one atomic push: dev, every version tag the batch made, the gate notes and
+  # every safety and vault branch origin lacks; origin takes all of it or none
+  local o refs="" v r have branches bnum br
+  if ! git fetch -q origin "+refs/heads/dev:refs/remotes/origin/dev" 2>/dev/null; then
+    _close_finish >/dev/null
+    rapid_info "origin unreachable, landed locally; 'rapid sync --dev' publishes it when origin is back"
+    return 0
+  fi
+  o=$(git rev-parse -q --verify refs/remotes/origin/dev || echo "$start")
+  if ! git merge-base --is-ancestor "$o" "$tip"; then
+    # the batch was built on a dev origin no longer has: its tested tree is not what dev would be
+    _batch_rollback "$start" "$tip"
+    rapid_die "origin's dev moved during the batch; local dev is back at $(git rev-parse --short "$start"), nothing was pushed: rapid sync in each branch, then land them again"
+  fi
+  for c in $(git rev-list --first-parent "$o..$tip"); do v=$(rapid_version_of "$c"); [ -z "$v" ] || refs="$refs refs/tags/$v"; done
+  git rev-parse -q --verify refs/notes/gates >/dev/null && refs="$refs refs/notes/gates:refs/notes/gates"
+  have=$(git ls-remote origin 'refs/heads/safety/*' 'refs/heads/vault/*' 2>/dev/null | cut -f2) || have=""
+  for r in $(git for-each-ref --format='%(refname)' refs/heads/safety refs/heads/vault); do
+    if grep -Fx -- "$r" <<<"$have" >/dev/null; then
+      continue
+    fi
+    # an anchor this push would publish: origin must hold no anchor of another branch with its number
+    case "$r" in refs/heads/safety/*)
+      bnum=$(sed -nE "s/^($RAPID_NUM_RE)[.].*/\\1/p" <<<"${r##*/}")
+      if [ -n "$bnum" ]; then
+        for br in $(grep -E "^refs/heads/safety/[^/]+/$bnum[.]" <<<"$have" || true); do
+          [ "$(git ls-remote origin "$br" 2>/dev/null | cut -f1)" = "$(git rev-parse "$r")" ] \
+            || rapid_die "branch number $bnum was published by another clone since this batch took it; nothing was pushed and the batch stays: rapid land --prune, then land the branches again (rapid land gives that branch the next free number)"
+        done
+      fi ;;
+    esac
+    # a vault branch whose tip dev does not hold (a re-land replaced its merge) stays local
+    case "$r" in refs/heads/vault/*) git merge-base --is-ancestor "$r" "$tip" 2>/dev/null || continue ;; esac
+    refs="$refs $r:$r"
+  done
+  # shellcheck disable=SC2086
+  RAPID_BATCH_CLOSE_PUSH=1 git push -q --atomic origin "$tip:refs/heads/dev" $refs \
+    || rapid_die "origin refused the batch push; nothing was published, nothing changed locally: dev and the batch stay, and rapid land again publishes them without testing the same tree twice (rapid land --prune puts dev back)"
+  branches=$(_close_finish)
+  rapid_info "published the batch in one push: $(git rev-list --first-parent --count "$o..$tip") merges, their tags and pointers"
+  # then, apart, each landed branch still on origin at its landed tip is deleted there, as a
+  # --pr land does; the rapid-branch-deletions ruleset leaves it to an admin for anyone else
+  local bl op lt kept=""
+  while IFS= read -r bl; do
+    [ -n "$bl" ] || continue
+    op=$(git ls-remote origin "refs/heads/$bl" 2>/dev/null | cut -f1) || op=""
+    [ -n "$op" ] || continue
+    lt=$(git rev-parse -q --verify "$(rapid_vault_ref "$bl")" 2>/dev/null) || lt=""
+    if [ "$op" != "$lt" ] || ! git push -q --force-with-lease="refs/heads/$bl:$op" origin ":refs/heads/$bl" </dev/null 2>/dev/null; then
+      kept="$kept $bl"
+    fi
+  done <<<"$branches"
+  for bl in $kept; do rapid_info "$bl stays on origin (landed; an admin deletes it with rapid branch --delete-landed)"; done
+}
+
+# _batch_prune: rapid land --prune, the rollback: dev back where the batch began,
+# its version tags dropped, nothing pushed, the branches unchanged and ready to land again.
+_batch_prune() {
+  local root bf start; root=$(rapid_root); cd "$root"
+  bf="$(git rev-parse --git-common-dir)/rapid/batch"
+  [ -s "$bf" ] || rapid_die "no batch is open; nothing to prune"
+  start=$(cat "$bf")
+  _batch_rollback "$start" "$(git rev-parse dev)"
+  rapid_info "batch pruned: local dev is back at $(git rev-parse --short "$start"), nothing was pushed, the branches are unchanged"
+}
+
+# _batch_halt: rapid land --halt: stop the close under test and keep the batch as it is
+# (dev, its tags and the branches stay; the next rapid land closes it).
+_batch_halt() {
+  local root bf cpid tip cid; root=$(rapid_root); cd "$root"
+  bf="$(git rev-parse --git-common-dir)/rapid/batch"
+  [ -s "$bf" ] || rapid_die "no batch is open; nothing to halt"
+  [ -s "$bf.closing" ] || rapid_die "no close of this batch is under test; nothing to halt"
+  read -r cpid tip cid < "$bf.closing" || true; rm -f "$bf.closing"
+  rapid_info "halted the close testing dev $(git rev-parse --short "${tip:-dev}" 2>/dev/null || true); the batch stays open, nothing was pushed"
+}
 # _land_rebase BRANCH NAME: rebase the checked-out stale BRANCH onto dev as rapid
 # sync does (preflight ref first, the register regenerated in each replayed
 # commit). On a conflict the rebase is undone, so the branch stays exactly as it
@@ -629,6 +924,8 @@ cmd_land() {
       --batch) defer=true; shift ;;
       --failed-gates-only) only=failed; shift ;;
       --verbose) export RAPID_VERBOSE=1; lflags+=("$1"); shift ;;
+      --halt) [ $# = 1 ] || RAPID_RC=2 rapid_die "land: unknown argument $2"; _batch_halt; return ;;
+      --prune) [ $# = 1 ] || RAPID_RC=2 rapid_die "land: unknown argument $2"; _batch_prune; return ;;
       -*) RAPID_RC=2 rapid_die "land: unknown argument $1" ;;
       *) lbranches+=("$1"); shift ;;
     esac
@@ -654,6 +951,7 @@ cmd_land() {
   if [ ${#lbranches[@]} -gt 0 ]; then
     local lrc=0
     _land_list ${lflags[@]+"${lflags[@]}"} -- "${lbranches[@]}" || lrc=$?
+    if [ "$lrc" = 0 ] && $batch && ! $defer && ! $dry; then _batch_close "$only"; return; fi
     return "$lrc"
   fi
   # rapid land never redoes what is done: with nothing left to land here (dev, or a branch
@@ -663,6 +961,7 @@ cmd_land() {
     if ! rapid_branch_parse "$branch" >/dev/null 2>&1 \
        || { grep -Fx -- "$branch" "$bf.branches" >/dev/null 2>&1 && git merge-base --is-ancestor HEAD dev 2>/dev/null; }; then
       if $dry; then rapid_info "dry run: nothing to land here; would close the batch open since dev $(git rev-parse --short "$(cat "$bf")")"; return 0; fi
+      _batch_close "$only"; return
     fi
   fi
   # a re-land lands each of its branches itself; a hand land in the middle would wedge its plan
@@ -902,6 +1201,7 @@ $(sed 's/^/  - /' <<<"$out")"
       || rapid_warn "could not comment on PR #$pr_no"
   fi
   # without --batch the land closes the batch it went into
+  if $batch && ! $defer && ! $dry; then _batch_close "$only"; fi
 }
 
 # _forge_repo: OWNER/REPO of origin (or conf forge_repo, for a mirror).

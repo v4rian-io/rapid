@@ -70,6 +70,16 @@ rapid_branch() { git symbolic-ref --short -q HEAD || [ $? = 1 ]; }
 # rapid_tmpdir NAME: a private temp directory honouring TMPDIR.
 rapid_tmpdir() { mktemp -d "${TMPDIR:-/tmp}/rapid-$1.XXXXXX"; }
 
+# rapid_progress DIR TOTAL PREFIX TEXT: one live line on stderr, "<PREFIX>[n/TOTAL] TEXT". n counts
+# the calls made on DIR exactly, under a lock, whatever order concurrent workers end in.
+rapid_progress() {
+  local d="$1" total="$2" pre="$3" text="$4" n i=0
+  until mkdir "$d/.progress.lock" 2>/dev/null; do i=$((i + 1)); [ "$i" -lt 200 ] || break; sleep 0.05; done
+  n=$(( $(cat "$d/.progress" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$d/.progress"
+  rmdir "$d/.progress.lock" 2>/dev/null || true
+  printf '%s[%s/%s] %s\n' "$pre" "$n" "$total" "$text" >&2
+}
+
 # rapid_private_wt NAME REV: a private detached work tree at REV in a new temp
 # directory; prints its path, rc 1 when it cannot be made. Every caller then
 # runs git -C on that path, so it must be a real work tree of its own: an

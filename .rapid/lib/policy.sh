@@ -125,3 +125,25 @@ rapid_docs_named() {
   fi
   [ -z "$got" ] || echo "Docs: ${got#, }"
 }
+
+# rapid_log_tail LOG: the last 25 lines of a gate's log as a gate record keeps them. The
+# record is pushed with dev and never rewritten, so every value (8 characters or more) of an
+# environment variable whose name holds TOKEN, SECRET, KEY, PASSWORD or CREDENTIAL is
+# replaced with <redacted> first.
+rapid_log_tail() {
+  { tail -n 25 "$1" 2>/dev/null || true; } | awk '
+    BEGIN {
+      for (k in ENVIRON) if (toupper(k) ~ /TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/) {
+        c = split(ENVIRON[k], part, "\n")
+        for (i = 1; i <= c; i++) if (length(part[i]) >= 8) v[++n] = part[i]
+      }
+    }
+    {
+      for (i = 1; i <= n; i++) {
+        out = ""
+        while ((j = index($0, v[i])) > 0) { out = out substr($0, 1, j - 1) "<redacted>"; $0 = substr($0, j + length(v[i])) }
+        $0 = out $0
+      }
+      print
+    }'
+}

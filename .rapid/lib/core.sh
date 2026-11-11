@@ -145,6 +145,9 @@ rapid_series() {
 }
 # rapid_branch_name KIND NAME [NUMBER] [SERIES] -> pool/<series>/[<number>.]<kind>.<name>.
 rapid_branch_name() { printf 'pool/%s/%s%s.%s' "${4:-$(rapid_series)}" "${3:+$3.}" "$1" "$2"; }
+# rapid_subject_branch SUBJECT: the branch a land's merge subject names
+# ("[MERGE] pool/v<series>/<number>.<kind>.<name> into dev: <version>"); empty for any other subject.
+rapid_subject_branch() { sed -nE 's/^\[MERGE\] (pool\/[^ ]+) into dev: .*/\1/p' <<<"$1"; }
 
 # Branch numbers. A branch is named pool/v<series>/<number>.<kind>.<name>: the number
 # orders branches by creation and is never handed out twice, online or offline.

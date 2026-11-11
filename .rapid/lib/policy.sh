@@ -69,6 +69,12 @@ rapid_agent_session() {
   return 1
 }
 
+rapid_policy_max_commits() {
+  local m; m=$(rapid_conf max_commits "$RAPID_MAX_COMMITS_DEFAULT")
+  [[ "$m" =~ ^[0-9]{1,4}$ ]] && [ "$m" -ge 1 ] || RAPID_RC=2 rapid_die "max_commits='$m' must be 1 to 9999"
+  printf '%s' "$m"
+}
+
 # rapid_gate_missing [DIR]: one line per gate whose command names a .rapid/tests
 # or .rapid/lint script DIR (default the work tree root) does not have.
 rapid_gate_missing() {
@@ -79,4 +85,43 @@ rapid_gate_missing() {
       [ -e "$dir/$p" ] || echo "gates_$g runs $p, which this repository does not have"
     done
   done
+}
+
+# rapid_path_in GLOBS PATH: 0 when PATH matches one of the comma-separated GLOBS.
+rapid_path_in() {
+  local g gs
+  # split on commas only: a glob is never expanded against the work tree
+  IFS=, read -r -a gs <<<"$1"
+  for g in ${gs[@]+"${gs[@]}"}; do
+    g="${g#"${g%%[![:space:]]*}"}"; g="${g%"${g##*[![:space:]]}"}"
+    [ -n "$g" ] || continue
+    # shellcheck disable=SC2053
+    [[ "$2" == $g ]] && return 0
+  done
+  return 1
+}
+
+# rapid_docs_named BASE TIP REQFILE: with docs_rules set, a branch that changes
+# code matching a rule's code glob changes a doc matching its doc glob, or
+# its requirement says "Docs: none (<reason>)". Prints the merge trailer
+# ("Docs: <doc>, ..." or "Docs: none (<reason>)"), or on rc 1 the reason.
+rapid_docs_named() {
+  local rules files r code doc hit need="" got="" why p rs
+  rules=$(rapid_conf docs_rules "")
+  [ -n "$rules" ] || return 0
+  files=$(git diff --name-only --no-renames "$1" "$2" || true)
+  IFS=, read -r -a rs <<<"$rules"
+  for r in ${rs[@]+"${rs[@]}"}; do
+    code="${r%%=*}"; doc="${r#*=}"; [ -n "$code" ] && [ -n "$doc" ] && [ "$code" != "$r" ] || continue
+    hit=""; while IFS= read -r p; do [ -n "$p" ] && rapid_path_in "$code" "$p" && hit=1; done <<<"$files"
+    [ -n "$hit" ] || continue
+    hit=""; while IFS= read -r p; do [ -n "$p" ] && rapid_path_in "$doc" "$p" && { hit="$p"; break; }; done <<<"$files"
+    if [ -n "$hit" ]; then got="$got, $hit"; else need="$need $code=$doc"; fi
+  done
+  if [ -n "$need" ]; then
+    why=$(sed -nE 's/^Docs: none \((.+)\)$/\1/p' "$3" | sed -n 1p)
+    [ -n "$why" ] && { echo "Docs: none ($why)"; return 0; }
+    echo "the branch changes code its docs describe and no doc:$need; change the doc, or say 'Docs: none (<reason>)' in the requirement"; return 1
+  fi
+  [ -z "$got" ] || echo "Docs: ${got#, }"
 }

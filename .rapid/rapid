@@ -12,6 +12,21 @@
 #                                      requirement_test=required
 #                                      (--test: the test file or scenario name that verifies it, as its Test: line);
 #                                      it also writes the safety anchor safety/v<series>/n<N>.<kind>.<name> (kept forever)
+#   rapid land [-F BODY] [--dry-run] [--failed-gates-only] [--verbose]
+#                                      merge the current branch into dev once, tagged, then close the open
+#                                      batch: this branch and every one landed with --batch are tested once on
+#                                      the final tree and go out in one push (no batch open: a batch of one).
+#                                      Run again it never redoes what is done: a close still owed runs, from
+#                                      the landed branch or from dev. --failed-gates-only runs again only the
+#                                      gates the previous close of this batch failed (refused when none failed)
+#                                      a branch behind dev is rebased onto it first (exit 4 on a conflict:
+#                                      the branch is left as it was, the files named, land_on_conflict fired)
+#   rapid land --batch [-F BODY] [--dry-run]
+#                                      the same land into the open batch, the close deferred: local, offline,
+#                                      no gate, no push; repeat it for every branch but the last
+#   rapid land --prune                   put dev back where the batch began and drop the batch, the branches unchanged
+#   rapid land --pr [-F BODY]            open or update the branch's PR (body = the merge body); once it has
+#                                      land_approvals approvals, land it the same way (exit 3 while waiting)
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid -h | --help
 #
@@ -374,6 +389,558 @@ _landed_live() {
   return 0
 }
 
+
+# _move_branch BRANCH NEW OLD: move BRANCH from OLD to NEW. When a work tree
+# (this one or a linked one) has BRANCH checked out, it fast-forwards there so
+# its files follow; a work tree with local changes keeps them and is told how
+# to catch up.
+_move_branch() {
+  local b="$1" new="$2" old="$3" line cur="" wt=""
+  while IFS= read -r line; do
+    case "$line" in
+      "worktree "*) cur="${line#worktree }" ;;
+      "branch refs/heads/$b") wt="$cur" ;;
+    esac
+  done <<<"$(git worktree list --porcelain)"
+  if [ -n "$wt" ]; then
+    git -C "$wt" -c core.hooksPath=/dev/null merge -q --ff-only "$new" >/dev/null 2>&1 && return 0
+    rapid_warn "$b is checked out with local changes in $wt; moved $b only. Catch that work tree up with: git -C $wt reset --keep $new"
+  fi
+  git update-ref "refs/heads/$b" "$new" "$old"
+}
+
+# ---------------------------------------------------------------- land
+# _body_trailers FILE: the final paragraph of a -F body when every line of it
+# is a 'Key: value' trailer (and a paragraph precedes it), else nothing.
+_body_trailers() {
+  grep -v '^#' "$1" | awk '{ l[NR] = $0 } END {
+      n = NR; while (n > 0 && l[n] ~ /^[[:space:]]*$/) n--
+      s = n; while (s > 0 && l[s] !~ /^[[:space:]]*$/) s--
+      if (s == 0) exit
+      for (i = s + 1; i <= n; i++) if (l[i] !~ /^[A-Z][A-Za-z-]+: [^ ]/) exit
+      for (i = s + 1; i <= n; i++) print l[i] }'
+}
+# _body_text FILE: the -F body without its comment lines and trailer paragraph.
+_body_text() {
+  local t; t=$(_body_trailers "$1")
+  if [ -z "$t" ]; then grep -v '^#' "$1" || true; return 0; fi
+  grep -v '^#' "$1" | awk -v n="$(wc -l <<<"$t" | tr -d ' ')" '{ l[NR] = $0 } END {
+      e = NR; while (e > 0 && l[e] ~ /^[[:space:]]*$/) e--
+      e -= n; while (e > 0 && l[e] ~ /^[[:space:]]*$/) e--
+      for (i = 1; i <= e; i++) print l[i] }'
+}
+
+# _land_msg BRANCH NEXT BODY_FILE TIP DEV_TIP GATES TREE_KEY TREE LNUM TICKET TEST DOCS EXTRA:
+# the merge message of branch tip TIP onto DEV_TIP, as rapid land writes it. GATES is the
+# test record: what ran on this merge tree, or that its gates are deferred to its batch close;
+# TREE_KEY is Tested-Tree for a merge whose own tree was gated, Merge-Tree for one that was not.
+_land_msg() {
+  local branch="$1" next="$2" body_file="$3" tip="$4" dev_tip="$5" gates="$6" tkey="$7" tree="$8" lnum="$9"
+  local ticket="${10}" req_test="${11}" docs="${12}" extra="${13}" ks kind slug
+  ks=$(rapid_branch_parse "$branch"); set -- $ks; kind="$1"; slug="$2"
+  printf '[MERGE] %s into dev: %s\n\n' "$branch" "$next"
+  if [ -n "$body_file" ]; then
+    _body_text "$body_file"
+  else
+    # a branch that states no requirement (requirement_test=optional) is named, nothing more
+    local rl; rl=$(git show "$tip:$(rapid_req_path "$tip" "$slug" || echo -)" 2>/dev/null | sed -n '3p' | sed -E 's/[[:space:]]+$//' || true)
+    if [ -n "$rl" ]; then printf 'Lands %s/%s: %s\n\n- Commits, oldest first.\n' "$kind" "$slug" "$rl"
+    else printf 'Lands the branch %s/%s.\n\n- Commits, oldest first.\n' "$kind" "$slug"; fi
+    git log --reverse --format='    - %h: %s.' "$dev_tip..$tip"
+  fi
+  printf '\nBranch-Base: %s\n' "$dev_tip"
+  # the Requirement: trailer names the file the branch carries; a branch without one has none
+  local rqm; ! rqm=$(rapid_req_path "$tip" "$slug") || printf 'Requirement: %s\n' "$rqm"
+  printf 'Gates: %s\n%s: %s\nBranch-Number: %s\n' "$gates" "$tkey" "$tree" "$lnum"
+  [ -z "$ticket" ] || printf 'Ticket: %s\n' "$ticket"
+  [ -z "$req_test" ] || printf 'Test: %s\n' "$req_test"
+  [ -n "$req_test" ] || [ -z "${rqm:-}" ] || git show "$tip:$rqm" 2>/dev/null | sed -nE 's/^(Untested: .+)$/\1/p' | sed -n 1p || true
+  [ -z "$docs" ] || printf '%s\n' "$docs"
+  [ -z "$extra" ] || printf '%s\n' "$extra"
+}
+
+# _land_violations BRANCH DEV_TIP [BODY_FILE]: every static land check of BRANCH
+# onto DEV_TIP (staleness, size, every commit's message, audit,
+# signature, policy flip and Fixes:, banned files, the requirement, its
+# register and test, I8, docs_rules, I7 and the merge message with its
+# -F body), one violation per line, nothing when it may land. It never stops
+# at the first: rapid land prints them all in one refusal before any gate,
+# and rapid check --land runs it for many branches at once. Read-only; checked
+# by the conf at RAPID_CONF_REV (dev's).
+_land_violations() {
+  local branch="$1" dev_tip="$2" body_file="${3:-}" tip ks kind slug n max c sc f viol email req rqf
+  local req_test="" pf docs="" ticket="" rq rs v rel next extra="" msg banned
+  tip=$(git rev-parse -q --verify "refs/heads/$branch^{commit}") || { echo "no branch $branch"; return 0; }
+  ks=$(rapid_branch_parse "$branch") || { echo "'$branch' is no pool/v<series>/n<N>.<kind>.<name> branch"; return 0; }
+  set -- $ks; kind="$1"; slug="$2"
+  n=$(git rev-list --count "$dev_tip..$tip"); max=$(rapid_policy_max_commits)
+  [ "$n" -ge 1 ] || echo "branch has no commits beyond dev"
+  [ "$n" -le "$max" ] || echo "branch carries $n commits, above max_commits=$max; split it into branches of one concern each"
+  [ -z "$(git rev-list --merges "$dev_tip..$tip")" ] || echo "branch holds a merge commit; rebase it onto dev (rapid sync) so the branch stays linear"
+  for c in $(git rev-list --reverse --no-merges "$dev_tip..$tip"); do
+    sc=$(git rev-parse --short "$c")
+    f=$(mktemp "${TMPDIR:-/tmp}/rapid-msg.XXXXXX"); git log -1 --format=%B "$c" >"$f"
+    [ -z "$viol" ] || echo "commit $sc breaks the message rules: $(tr '\n' ';' <<<"$viol")"
+    viol=$(rapid_trailer "$c" Fixes)
+    if [ -n "$viol" ]; then
+      git rev-parse -q --verify "$viol^{commit}" >/dev/null && git merge-base --is-ancestor "$viol" "$dev_tip" \
+        || echo "commit $sc says Fixes: $viol, which names no commit on dev"
+    fi
+  done
+  # the static half of the red rules (no gate runs at a land): a Red: commit is never
+  # the branch tip, and the commit after a Red: commit carries none
+  local rprev=""
+  for c in $(git rev-list --reverse --no-merges "$dev_tip..$tip"); do
+    if [ -n "$(rapid_trailer "$c" Red)" ]; then
+      [ -z "$rprev" ] || echo "commit $(git rev-parse --short "$c") carries Red: right after the Red: commit $rprev; the commit after a red one turns it green"
+      rprev=$(git rev-parse --short "$c")
+    else rprev=""; fi
+  done
+  [ -z "$rprev" ] || echo "commit $rprev carries Red: and a Red: commit cannot be the branch tip; add the commit that turns it green"
+  [ -z "$banned" ] || echo "the branch adds banned file(s): $(tr '\n' ' ' <<<"$banned")(secrets, keys, builds, .env, archives never enter history); drop them from the branch's commits"
+  local rqp; rqp=$(rapid_req_path "$tip" "$slug" || true)
+  if [ -n "$rqp" ] && req=$(git show "$tip:$rqp" 2>/dev/null); then
+    if grep -qF "$RAPID_REQ_PLACEHOLDER" <<<"$req"; then
+      echo "$rqp still holds the placeholder; state the requirement this branch meets and how its tests verify it"
+    elif [ "$(sed -n '3,$p' <<<"$req" | sed '/^Ticket: /d' | wc -w | tr -d ' ')" -lt 3 ]; then
+      printf '%s\n' "$rqp states no requirement (three words at least: what the branch meets and how its tests verify it)"
+    fi
+    # a test that is given is checked, whatever the mode; requirement_test=required also asks
+    # for eight words and for a test (or the reason there is none)
+    local rmode; rmode=$(rapid_conf requirement_test optional)
+    [ "$rmode" != required ] || [ "$(sed -n '3,$p' <<<"$req" | grep -vE '^[A-Z][A-Za-z-]+: ' | wc -w | tr -d ' ')" -ge 8 ] \
+      || echo "$rqp says too little: eight words or more on what the branch meets and how it is verified"
+    req_test=$(sed -nE 's/^Test: (.+)$/\1/p' <<<"$req" | sed -n 1p | sed -E 's/[[:space:]]+$//')
+    if [ -n "$req_test" ]; then
+      pf="$req_test"
+      git cat-file -e "$tip:$pf" 2>/dev/null || { [[ "$pf" =~ ^[a-z0-9][a-z0-9-]*$ ]] && pf=".rapid/tests/scenarios/$pf.sh"; }
+      git cat-file -e "$tip:$pf" 2>/dev/null \
+        || echo "$rqp says Test: $req_test, which the branch tip does not hold; name the test file (or scenario name) that verifies it"
+    elif [ "$rmode" = required ] && ! grep -E '^Untested: ([^ ]+ +){4}[^ ]' <<<"$req" >/dev/null; then
+      echo "$rqp names no test: add 'Test: <test file or scenario name>' (or 'Untested: <reason>')"
+    fi
+    ticket=$(sed -nE 's/^Ticket: ([A-Z][A-Z0-9]*-[0-9]+)$/\1/p' <<<"$req" | sed -n 1p)
+    rqf=$(mktemp "${TMPDIR:-/tmp}/rapid-req.XXXXXX"); printf '%s\n' "$req" > "$rqf"
+    docs=$(rapid_docs_named "$dev_tip" "$tip" "$rqf") || { echo "$docs"; docs=""; }
+    rm -f "$rqf"
+  elif [ "$(rapid_conf requirement_test optional)" = required ]; then
+    echo "$RAPID_REQ_DIR/$slug.md is not committed on the branch (I8)"
+  else
+    # no requirement stated (requirement_test=optional): the docs rules still hold
+    rqf=$(mktemp "${TMPDIR:-/tmp}/rapid-req.XXXXXX"); : > "$rqf"
+    docs=$(rapid_docs_named "$dev_tip" "$tip" "$rqf") || { echo "$docs"; docs=""; }
+    rm -f "$rqf"
+  fi
+  # landed requirements are never edited or deleted (I8)
+  while IFS=$'\t' read -r rq rs; do
+    [ -n "$rs" ] || continue
+    local rsl="${rs##*/}"; rsl="${rsl%.md}"
+    [ "$rsl" = "$slug" ] && continue
+    rapid_slug_landed "$rsl" || continue
+    echo "the branch changes $rs ($rq), which landed with $rsl; landed requirements are never edited or deleted (I8)"
+  done <<<"$(git diff --name-status --no-renames "$dev_tip" "$tip" -- "$RAPID_REQ_DIR/" || true)"
+  ! rapid_slug_landed "$slug" "$dev_tip" || echo "name '$slug' already landed (I7)"
+  # the merge message, drafted now with the next version, so its rules refuse before any gate
+  # a -F body (rapid land checked the file itself): its trailer paragraph joins the draft
+  [ -z "$body_file" ] || [ ! -f "$body_file" ] || extra=$(_body_trailers "$body_file")
+  read -r v rel <<<"$(rapid_version_last "$dev_tip")"
+  next=$(rapid_version_next "$v" "$rel" "$(rapid_year)")
+  msg=$(mktemp "${TMPDIR:-/tmp}/rapid-merge.XXXXXX")
+  _land_msg "$branch" "$next" "$body_file" "$tip" "$dev_tip" "deferred to the close of batch 0000000" Merge-Tree "$(git rev-parse "$tip^{tree}")" \
+    "$(rapid_branch_number "$branch")" "$ticket" "$req_test" "$docs" "$extra" > "$msg"
+  [ -z "$viol" ] || echo "merge message: $(tr '\n' ';' <<<"$viol")"
+  return 0
+}
+
+cmd_land() {
+  local body_file="" dry=false pr=false batch=false root branch ks kind slug dev_tip n max c v rel next wt tree msg merge out g_fast g_full email pr_no=""
+  local lflags=() lbranches=() defer=false only="" bf
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -F) body_file="${2:-}"; lflags+=(-F "${2:-}"); shift 2 ;;
+      --dry-run) dry=true; RAPID_DRY=1; lflags+=("$1"); shift ;;
+      --pr) pr=true; lflags+=("$1"); shift ;;
+      --batch) defer=true; shift ;;
+      --failed-gates-only) only=failed; shift ;;
+      --verbose) export RAPID_VERBOSE=1; lflags+=("$1"); shift ;;
+      -*) RAPID_RC=2 rapid_die "land: unknown argument $1" ;;
+      *) lbranches+=("$1"); shift ;;
+    esac
+  done
+  # a land goes into the open batch: local, offline, no gate, nothing pushed. With
+  # --batch the close is deferred; without it the land closes the batch: one test of
+  # the final tree, one push. Only --pr publishes by itself, so only it gates at once.
+  if $pr; then
+    batch=false
+    $defer && RAPID_RC=2 rapid_die "land: --batch and --pr do not combine; a --pr land publishes itself"
+    [ -z "$only" ] || RAPID_RC=2 rapid_die "land: --failed-gates-only and --pr do not combine; a --pr land closes no batch"
+  else
+    batch=true
+  fi
+  [ -z "$only" ] || ! $defer || RAPID_RC=2 rapid_die "land: --failed-gates-only goes with the close, which --batch defers"
+  root=$(rapid_root); cd "$root"
+  bf="$(git rev-parse --git-common-dir)/rapid/batch"
+  if [ -n "$only" ]; then
+    # refused before anything lands: only a batch whose previous close failed a gate has gates to run again
+    grep -E ' fail$' "$bf.gates" >/dev/null 2>&1 \
+      || rapid_die "land --failed-gates-only: no close of this batch has failed a gate, so there is nothing to run again; run rapid land, which runs every gate"
+  fi
+  if [ ${#lbranches[@]} -gt 0 ]; then
+    local lrc=0
+    return "$lrc"
+  fi
+  # rapid land never redoes what is done: with nothing left to land here (dev, or a branch
+  # this batch already holds) the close still owed is all that runs
+  if $batch && ! $defer && [ -s "$bf" ]; then
+    branch=$(rapid_branch)
+    if ! rapid_branch_parse "$branch" >/dev/null 2>&1 \
+       || { grep -Fx -- "$branch" "$bf.branches" >/dev/null 2>&1 && git merge-base --is-ancestor HEAD dev 2>/dev/null; }; then
+      if $dry; then rapid_info "dry run: nothing to land here; would close the batch open since dev $(git rev-parse --short "$(cat "$bf")")"; return 0; fi
+    fi
+  fi
+  # a re-land lands each of its branches itself; a hand land in the middle would wedge its plan
+  local extra=""
+  if [ -n "$body_file" ]; then
+    [ -f "$body_file" ] || rapid_die "body file $body_file not found"
+    [ -n "$(grep -v '^#' "$body_file" | sed '/^[[:space:]]*$/d' || true)" ] || rapid_die "body file $body_file is empty; write the merge body (a paragraph, then a '- ' list) or leave -F out for the default"
+    # a final paragraph of 'Key: value' lines is trailers: they join the merge's trailer block
+    extra=$(_body_trailers "$body_file")
+    if grep -E '^(Branch-Base|Requirement|Gates|Tested-Tree|Branch-Number|Ticket|Test|Docs|Untested): ' <<<"$extra" >/dev/null; then
+      rapid_die "body file $body_file sets a trailer rapid land writes itself (Branch-Base, Requirement, Gates, Tested-Tree, Branch-Number, Ticket, Test, Docs, Untested); drop it"
+    fi
+  fi
+  branch=$(rapid_branch)
+  # run again on dev after everything landed: nothing is owed, which is no failure
+  if [ "$(git symbolic-ref --short -q HEAD 2>/dev/null)" = dev ] && [ ! -s "$bf" ]; then rapid_info "nothing to land; no close is owed"; return 0; fi
+  ks=$(rapid_branch_parse "$branch") || rapid_die "no batch is open and there is no branch to land here: land runs on a pool/v<series>/<number>.<kind>.<name> branch (on '${branch:-detached}')"
+  rapid_branch_open "$branch" || rapid_die "'$branch' is not an open branch"
+  set -- $ks; kind="$1"; slug="$2"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit them to the branch first"
+  git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
+  # a number another clone published first: the branch, still unpublished, takes the next one
+  $dry || branch=$(_branch_renumber_taken "$branch" "$kind" "$slug")
+  dev_tip=$(git rev-parse dev)
+  export RAPID_CONF_REV="$dev_tip"
+  # no gate is never silent: an unset full gate is refused, an explicit none is said out loud.
+  # A branch keeps a gates_full in its own conf; one that sets it lands even on a dev that has none.
+  local lfull; lfull=$(RAPID_CONF_REV=HEAD rapid_conf gates_full "")
+  [ -n "$lfull" ] || rapid_die "policy: this branch's .rapid/conf sets no gates_full; keep the full gate, or gates_full=none to land without one"
+  case "$(rapid_conf gates_full "")" in
+    "") rapid_warn "dev's .rapid/conf sets no gates_full, so this land runs no full gate; this branch sets gates_full=$lfull for the next" ;;
+    none) rapid_warn "gates_full=none: this land runs no full gate on the merge tree" ;;
+  esac
+  # A shared branch: commits a coworker pushed to origin's copy are never lost.
+  local obranch=""
+  if rapid_has_remote && [ "$RAPID_OFFLINE" != 1 ]; then
+    obranch=$(git ls-remote origin "refs/heads/$branch" 2>/dev/null | cut -f1 || true)
+    local ocheck="$obranch"
+    # a land --pr head is the merge; its branch side is what must be in this branch
+    if [ -n "$obranch" ] && git cat-file -e "$obranch^{commit}" 2>/dev/null && [ "$(git rev-list --parents -n1 "$obranch" | wc -w | tr -d ' ')" = 3 ]; then
+      ocheck=$(git rev-parse "$obranch^2")
+    fi
+    # a copy this clone rebased itself (sync never pushes) is kept under its preflight refs: nothing is lost
+    if [ -n "$obranch" ] && ! { git cat-file -e "$ocheck^{commit}" 2>/dev/null && { git merge-base --is-ancestor "$ocheck" HEAD \
+         || [ -n "$(git for-each-ref --contains "$ocheck" --format=x "refs/rapid/preflight/$slug/")" ]; }; }; then
+      rapid_die "origin's $branch holds commits this clone lacks ($(git rev-parse --short "$obranch" 2>/dev/null || printf '%s' "${obranch:0:7}")); fetch them (git pull --rebase origin $branch) and land again"
+    fi
+  fi
+  if ! $pr && [ "$(rapid_conf land_pr optional)" = required ]; then
+    rapid_die "policy: land_pr=required; land through review with 'rapid land --pr'"
+  fi
+  # staleness: the branch must contain dev's tip, so the tested tree is the merge tree; land rebases a stale branch itself
+  if [ "$(git merge-base dev HEAD)" != "$dev_tip" ]; then
+    ! $dry || rapid_die "branch is behind dev ($(git rev-parse --short "$dev_tip")); rapid land rebases it (a dry run writes nothing)"
+  fi
+  # every static check at once, before any gate: one refusal lists every violation
+  out=$(_land_violations "$branch" "$dev_tip" "$body_file")
+  [ -z "$out" ] || rapid_die "land refused for $(wc -l <<<"$out" | tr -d ' ') reason(s); fix them all, then land again:
+$(sed 's/^/  - /' <<<"$out")"
+  # what the merge records: the test and ticket of the requirement, the docs_rules trailer (all checked above)
+  local req_test="" ticket docs rqf; rqf=$(mktemp "${TMPDIR:-/tmp}/rapid-req.XXXXXX"); git show "HEAD:$(rapid_req_path HEAD "$slug" || echo -)" > "$rqf" 2>/dev/null || : > "$rqf"
+  req_test=$(sed -nE 's/^Test: (.+)$/\1/p' "$rqf" | sed -n 1p | sed -E 's/[[:space:]]+$//')
+  ticket=$(sed -nE 's/^Ticket: ([A-Z][A-Z0-9]*-[0-9]+)$/\1/p' "$rqf" | sed -n 1p)
+  docs=$(rapid_docs_named "$dev_tip" HEAD "$rqf") || docs=""
+  rm -f "$rqf"
+  # a close that passed its test is publishing the batch: a land now would miss that push
+  local pubf; pubf="$(git rev-parse --git-common-dir)/rapid/batch.publishing"
+  rapid_lock_lift "$pubf" "rapid land" || rapid_die "a close is publishing the batch; land again when it ends"
+  if $batch; then
+    # a land goes into the open batch: no gate here; rapid land gates the
+    # final tree once and pushes once
+    # from here the land is offline: nothing reaches origin before the close
+    export RAPID_OFFLINE=1
+    local bf; bf="$(git rev-parse --git-common-dir)/rapid/batch"; mkdir -p "$(dirname "$bf")"
+    $dry || [ -s "$bf" ] || git rev-parse dev > "$bf"
+    if ! $dry && [ -s "$bf.closing" ]; then
+      # no point finishing a test another one replaces: stop the close, land, test the new final tree
+      local cpid ctip ccid; read -r cpid ctip ccid < "$bf.closing" || true
+      # a close that is gone left its marker: lifted and logged; a live one is stopped
+      if ! rapid_lock_lift "$bf.closing" "rapid land"; then
+        rapid_info "-> stopped the close testing $(git rev-parse --short dev): the batch has a new final tree"
+      fi
+    fi
+    $dry || rapid_info "-> batch $(git rev-parse --short "$(cat "$bf")"): gates deferred to the close of the batch; nothing is pushed until then"
+  else
+  rapid_info "-> check --each (fast gate on every branch commit)"
+  fi
+  read -r v rel <<<"$(rapid_version_last dev)"
+  next=$(rapid_version_next "$v" "$rel" "$(rapid_year)")
+  git rev-parse -q --verify "refs/tags/$next" >/dev/null && rapid_die "tag $next already exists; run 'rapid doctor --history'"
+  # Build the merge in a private worktree and gate the merge tree itself.
+  wt=$(rapid_private_wt land "$dev_tip") || rapid_die "cannot make a private work tree under ${TMPDIR:-/tmp}; dev unchanged"
+  if ! git -C "$wt" -c core.hooksPath=/dev/null merge -q --no-ff --no-commit "$branch" >/dev/null 2>&1; then
+    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rapid_die "the merge does not apply cleanly; run 'rapid sync'"
+  fi
+  # the merge tree is the tree the gates check, and the Tested-Tree of the merge
+  tree=$(git -C "$wt" write-tree)
+  local gates="" tkey="" gr=""
+  if $batch; then
+    local bstart; bstart=$(cat "$(git rev-parse --git-common-dir)/rapid/batch" 2>/dev/null || git rev-parse dev)
+    # no gate runs on this merge tree, and its test record says exactly that: the close of the
+    # batch tests the final tree once and records the result on the last merge of the batch
+    gates="deferred to the close of batch $(git rev-parse --short "$bstart")"; tkey=Merge-Tree
+  else
+  # both gates run on the merge tree, each recorded for the merge's gate log note
+  gr=$(rapid_tmpdir gaterec)
+  [ "$(git -C "$wt" write-tree)" = "$tree" ] || { git -C "$wt" merge --abort >/dev/null 2>&1 || true; git worktree remove --force "$wt" >/dev/null 2>&1 || true; rapid_die "a gate changed the staged merge tree; dev unchanged"; }
+  gates="fast=$g_fast full=$g_full"; tkey=Tested-Tree
+  fi
+  git -C "$wt" merge --abort >/dev/null 2>&1 || true
+  git worktree remove --force "$wt" >/dev/null 2>&1 || true
+  # the branch's fork point stays forever (a branch made before anchors gets one
+  # where it leaves dev) and its number goes into the merge; a branch made
+  # before numbers takes the next one now
+  local anchor rem="" lnum r anchors=""
+  if rapid_has_remote && [ "$RAPID_OFFLINE" != 1 ]; then rem=origin; fi
+  if $dry; then
+    # a dry run writes nothing: no anchor
+    anchor=$(rapid_anchor_ref "$branch"); lnum=$(rapid_branch_number "$branch"); lnum="${lnum:-<the next number, taken at land>}"
+  else
+    anchor=$(rapid_anchor_make "$branch" "$(git merge-base "$dev_tip" HEAD)" "$rem")
+    lnum=$(_branch_number_of "$branch")
+    [ -n "$lnum" ] || lnum=$(_number_take "$kind" "$slug" "$dev_tip" "$anchor")
+  fi
+  anchors="$anchor:$anchor"
+  msg=$(mktemp "${TMPDIR:-/tmp}/rapid-merge.XXXXXX")
+  _land_msg "$branch" "$next" "$body_file" HEAD "$dev_tip" "$gates" "$tkey" "$tree" "$lnum" "$ticket" "$req_test" "$docs" "$extra" > "$msg"
+  [ -z "$out" ] || { rm -f "$msg"; rapid_die "merge message: $(tr '\n' ';' <<<"$out")"; }
+  if $dry; then
+    rapid_info "dry run: would land $branch as $next (gates $gates), message:"; sed 's/^/  | /' "$msg"; rm -f "$msg"; [ -z "$gr" ] || rm -rf "$gr"; return 0
+  fi
+  # signed=required: the merge and its version tag are signed with the lander's key
+  local sign="" tsign=""
+  if [ "$(rapid_conf signed optional)" = required ]; then sign="-S"; tsign="-s"; fi
+  local forge_merged=0
+  if $pr && [ "$(rapid_conf land_pr optional)" = required ]; then
+    # Under land_pr=required GitHub's review rule refuses any push to dev, so
+    # the merge is made through the PR: the PR head is the branch tip the gates
+    # ran on, approvals and statuses count on that sha, and GitHub's merge API
+    # writes the merge once with rapid's subject and body (merge-once kept).
+    # rapid then verifies the merge (parents old dev and the tested head, tree
+    # the Tested-Tree, the subject) before it tags it; a mismatch leaves the
+    # tag off and says so.
+    local head; head=$(git rev-parse HEAD)
+    pr_no=$(_land_pr_gate "$branch" "$msg" "$head" "$obranch") || { local prc=$?; rm -f "$msg"; exit "$prc"; }
+    merge=$(_land_pr_merge "$pr_no" "$msg" "$head" "$dev_tip" "$tree") || { rm -f "$msg"; exit 1; }
+    obranch=$(git ls-remote origin "refs/heads/$branch" 2>/dev/null | cut -f1 || true)
+    forge_merged=1
+  elif $pr; then
+    # The merge commit is the PR head: reviewers approve the exact commit dev
+    # will move to, and a new branch commit or a moved dev makes a new merge,
+    # so earlier approvals no longer count. An unchanged branch reuses the merge.
+    merge=""
+    if [ -n "$obranch" ] && [ "$(git rev-list --parents -n1 "$obranch" 2>/dev/null)" = "$obranch $dev_tip $(git rev-parse HEAD)" ] \
+       && [ "$(git rev-parse "$obranch^{tree}")" = "$tree" ]; then
+      merge="$obranch"
+      # the reused merge keeps its own message (its Gates test record), so the PR body stays the merge body
+      git log -1 --format=%B "$merge" > "$msg"
+    else
+      merge=$(git commit-tree $sign "$tree" -p "$dev_tip" -p HEAD -F "$msg")
+    fi
+    pr_no=$(_land_pr_gate "$branch" "$msg" "$merge" "$obranch") || { local prc=$?; rm -f "$msg"; exit "$prc"; }
+    obranch="$merge"
+  else
+    merge=$(git commit-tree $sign "$tree" -p "$dev_tip" -p HEAD -F "$msg")
+  fi
+  # a local note: pre-push reruns the fast gate on a merge this clone neither gated nor
+  # closed; a batch merge gets its note from the close that tested its batch
+  $batch || git notes --ref=rapid-close add -f -m "fast=$g_fast full=$g_full tree=$tree clone=$(rapid_clone_id)" "$merge" >/dev/null 2>&1 || true
+  # the durable gate log: a note on the merge under refs/notes/gates, published with dev and the tag
+  # the gate log of the merge: the records of its merge-tree gates, each with
+  # its command, exit code, duration and log tail (a batch's are run at its close)
+  local glog g gf; glog=$(mktemp "${TMPDIR:-/tmp}/rapid-gatelog.XXXXXX")
+  printf 'rapid land %s/%s as %s: merge tree %s\n\n' "$kind" "$slug" "$next" "$tree" > "$glog"
+  if $batch; then
+    printf 'gates %s: no gate ran on this merge tree at the land\n' "$gates" >> "$glog"
+  else
+  for g in fast full; do
+    gf="${gr:-/nonexistent}/$g"
+    if [ -f "$gf" ]; then cat "$gf" >> "$glog"; printf '\n' >> "$glog"
+    else printf 'gate=%s\nexit=none (no gate configured)\n\n' "$g" >> "$glog"; fi
+  done
+  fi
+  git notes --ref=gates add -f -F "$glog" "$merge" >/dev/null 2>&1 || rapid_die "could not write the gate log note on $(git rev-parse --short "$merge")"
+  rm -f "$msg" "$glog"; [ -z "$gr" ] || rm -rf "$gr"
+  # shellcheck disable=SC2086
+  git tag -a $tsign "$next" -m "rapid land $kind/$slug" "$merge" 2>/dev/null \
+    || rapid_die "another land took $next a moment ago; dev is unchanged. Run 'rapid sync', then land again"
+  # the branch's end stays forever too: its vault branch (written once; a re-land keeps the first)
+  local vref vobj=""; vref=$(rapid_vault_ref "$branch")
+  if ! git rev-parse -q --verify "$vref" >/dev/null; then
+    vobj=$(git rev-parse "$merge^2")
+    anchors="$anchors $vobj:$vref"
+  fi
+  # the branch's fork point stays forever: a branch made before anchors gets one where it leaves dev
+  local where="no remote, landed locally"
+  if $batch && ! rapid_has_remote; then
+    where="no remote, landed locally into the batch; its close tests it"
+  elif $batch; then
+    where="in the batch; its close tests it and pushes it"
+  elif rapid_has_remote && [ "$RAPID_OFFLINE" = 1 ]; then
+    where="origin unreachable, landed locally; 'rapid sync --dev' publishes it when origin is back"
+  elif rapid_has_remote; then
+    # One atomic push: dev, the tag and the branch's anchor, number and vault branch land together or not at all.
+    # After a merge through the PR, origin's dev already holds the merge: the push carries the rest.
+    local devref="$merge:refs/heads/dev"; [ "$forge_merged" = 0 ] || devref=""
+    # shellcheck disable=SC2086
+    if ! git push -q --atomic origin $devref "refs/tags/$next" $anchors refs/notes/gates:refs/notes/gates; then
+      git tag -d "$next" >/dev/null
+      rapid_die "push refused or the link dropped; nothing changed locally or on origin (dev, $next). Run 'rapid sync' if dev moved, then land again"
+    fi
+    where="pushed"
+    # Then, apart, the landed branch is deleted on origin, only where origin still holds what
+    # was landed. The rapid-branch-deletions ruleset lets only admins delete a branch: for anyone
+    # else it stays, listed by rapid status and rapid doctor, until an admin runs rapid branch --delete-landed.
+    if [ -n "$obranch" ]; then
+      if git push -q --force-with-lease="refs/heads/$branch:$obranch" origin ":refs/heads/$branch" </dev/null 2>/dev/null; then
+        where="$where; $branch deleted on origin"
+      else
+        where="$where; $branch stays on origin (landed; an admin deletes it with rapid branch --delete-landed)"
+      fi
+    fi
+  fi
+  [ -z "$vobj" ] || git update-ref "$vref" "$vobj" "$RAPID_ZERO" 2>/dev/null || true
+  _move_branch dev "$merge" "$dev_tip"
+  # why dev could not be checked out, when it could not, is kept in rapid's own log in the git dir
+  mkdir -p "$(git rev-parse --git-common-dir)/rapid"
+  if ! git switch -q dev 2>>"$(git rev-parse --git-common-dir)/rapid/log"; then git switch -q --detach "$merge"; fi
+  # a batch keeps the branch until its close: a failing close leaves every branch as it was
+  if $batch; then printf '%s\n' "$branch" >> "$(git rev-parse --git-common-dir)/rapid/batch.branches"; else git branch -q -D "$branch"; fi
+  rapid_info "landed $kind/$slug as $next ($(git rev-parse --short "$merge")); gates $gates; $where"
+  [ -z "$ticket" ] || rapid_tracker_call transition "$ticket" --to done --ref "$next" >/dev/null || rapid_warn "ticket $ticket was not moved to done; the land stands"
+  if [ -n "$pr_no" ]; then
+    gh pr comment "$pr_no" --repo "$(_forge_repo)" --body "Landed by rapid land as $next ($(git rev-parse --short "$merge"))." >/dev/null 2>&1 \
+      || rapid_warn "could not comment on PR #$pr_no"
+  fi
+  # without --batch the land closes the batch it went into
+}
+
+# _forge_repo: OWNER/REPO of origin (or conf forge_repo, for a mirror).
+_forge_repo() {
+  local r url
+  r=$(rapid_conf forge_repo "")
+  if [ -z "$r" ]; then
+    url=$(git remote get-url origin 2>/dev/null || true)
+    r=$(sed -nE 's#^(https://[^/]+/|git@[^:]+:|ssh://git@[^/]+/)([^/]+/[^/]+)$#\2#p' <<<"$url" | sed -E 's/\.git$//')
+  fi
+  [[ "$r" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || rapid_die "land --pr: cannot tell OWNER/REPO from origin; set forge_repo in .rapid/conf"
+  printf '%s' "$r"
+}
+
+# _land_pr_gate BRANCH MSGFILE MERGE OLDHEAD: publish MERGE as the branch's head
+# (leased on OLDHEAD), open or update its PR with the merge subject as title
+# and the merge body as body, and pass only once the PR has land_approvals
+# approving reviews given on MERGE itself and, with land_pr=required, the
+# rapid-check status succeeded on MERGE. Prints the PR number. The forge's merge
+# button is never used: the land itself stays rapid land's.
+_land_pr_gate() {
+  local branch="$1" msg="$2" m="$3" old="${4:-}" repo n need have bodyf checks lease=""
+  rapid_has_remote || rapid_die "land --pr needs an origin remote"
+  [ "$RAPID_OFFLINE" = 1 ] && rapid_die "land --pr needs origin; it is unreachable"
+  command -v gh >/dev/null 2>&1 || rapid_die "land --pr needs the gh CLI"
+  repo=$(_forge_repo)
+  if [ "$old" != "$m" ]; then
+    [ -z "$old" ] || lease="--force-with-lease=refs/heads/$branch:$old"
+    # shellcheck disable=SC2086
+    git push -q --atomic $lease origin "$m:refs/heads/$branch" $(_anchor_refspecs "$branch") || rapid_die "publishing $(git rev-parse --short "$m") as $branch's head failed (origin's branch moved?)"
+  fi
+  bodyf=$(mktemp "${TMPDIR:-/tmp}/rapid-pr.XXXXXX"); sed '1,2d' "$msg" > "$bodyf"
+  n=$(gh pr list --repo "$repo" --head "$branch" --base dev --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+  if [ -z "$n" ]; then
+    gh pr create --repo "$repo" --base dev --head "$branch" --title "$(sed -n 1p "$msg")" --body-file "$bodyf" >/dev/null \
+      || { rm -f "$bodyf"; rapid_die "opening the PR for $branch failed"; }
+    n=$(gh pr list --repo "$repo" --head "$branch" --base dev --state open --json number --jq '.[0].number // empty')
+  else
+    gh pr edit "$n" --repo "$repo" --title "$(sed -n 1p "$msg")" --body-file "$bodyf" >/dev/null \
+      || { rm -f "$bodyf"; rapid_die "updating PR #$n failed"; }
+  fi
+  rm -f "$bodyf"
+  [ -n "$n" ] || rapid_die "the forge did not report a PR number for $branch"
+  need=$(rapid_conf land_approvals 1)
+  [[ "$need" =~ ^[0-9]{1,2}$ ]] || RAPID_RC=2 rapid_die "land_approvals='$need' must be 0 to 99"
+  have=$(_pr_approvals "$repo" "$n" "$m")
+  if [ "$have" -lt "$need" ]; then
+    rapid_info "PR #$n carries $(git rev-parse --short "$m") and has $have of $need approval(s) on it; run 'rapid land --pr' again once it is approved" >&2
+    return 3
+  fi
+  if [ "$(rapid_conf land_pr optional)" = required ]; then
+    # both required statuses: rapid-check (shape, gates, approvals) and commit-audit (the commit audit)
+    local st
+    for st in rapid-check commit-audit; do
+      checks=$(gh api "repos/$repo/commits/$m/check-runs" --jq "[.check_runs[] | select(.name == \"$st\" and .conclusion == \"success\")] | length" 2>/dev/null || echo 0)
+      [[ "$checks" =~ ^[0-9]+$ ]] || checks=0
+      if [ "$checks" -lt 1 ]; then
+        rapid_info "PR #$n is approved; waiting for the $st status on $(git rev-parse --short "$m"); run 'rapid land --pr' again once it passes" >&2
+        return 3
+      fi
+    done
+  fi
+  rapid_info "PR #$n approved ($have of $need) on $(git rev-parse --short "$m")" >&2
+  printf '%s' "$n"
+}
+
+# _land_pr_merge N MSG HEAD DEV TREE: merge PR N through GitHub's merge API
+# (merge_method=merge, sha=HEAD, rapid's subject and body), fetch origin's dev
+# and print the merge once it is exactly the one rapid land would write: parents
+# DEV and HEAD, tree TREE, rapid's subject. Refuses, untagged, otherwise.
+_land_pr_merge() {
+  local n="$1" msg="$2" head="$3" dev="$4" tree="$5" repo sha m title
+  repo=$(_forge_repo); title=$(sed -n 1p "$msg")
+  sha=$(gh api -X PUT "repos/$repo/pulls/$n/merge" -f merge_method=merge -f sha="$head" \
+        -f commit_title="$title" -f commit_message="$(sed '1,2d' "$msg")" --jq .sha 2>"$msg.err") \
+    || { rapid_warn "$(cat "$msg.err")"; rm -f "$msg.err"; rapid_die "GitHub refused to merge PR #$n at $(git rev-parse --short "$head"); dev is unchanged"; }
+  rm -f "$msg.err"
+  git fetch -q origin "+refs/heads/dev:refs/remotes/origin/dev" || rapid_die "PR #$n was merged on GitHub ($sha) but origin's dev cannot be fetched; run rapid sync --dev, then rapid doctor"
+  m=$(git rev-parse -q --verify "refs/remotes/origin/dev^{commit}")
+  [ "$m" = "$sha" ] || rapid_die "origin's dev ($m) is not GitHub's merge of PR #$n ($sha); no tag was made"
+  [ "$(git rev-list --parents -n1 "$m")" = "$m $dev $head" ] \
+    || rapid_die "GitHub's merge $m has parents $(git rev-list --parents -n1 "$m" | cut -d' ' -f2-), not dev $dev and the tested head $head; no tag was made"
+  [ "$(git rev-parse "$m^{tree}")" = "$tree" ] || rapid_die "GitHub's merge $m tree is not the tested tree $tree; no tag was made"
+  [ "$(git log -1 --format=%s "$m")" = "$title" ] || rapid_die "GitHub's merge $m subject is not '$title'; no tag was made"
+  printf '%s' "$m"
+}
+
+# _pr_approvals REPO N SHA: distinct approving reviewers of PR N whose review
+# was given on SHA (an approval of an earlier head never counts).
+_pr_approvals() {
+  local have
+  have=$(gh api "repos/$1/pulls/$2/reviews" --jq "[.[] | select(.state == \"APPROVED\" and .commit_id == \"$3\") | .user.login] | unique | length" 2>/dev/null || echo 0)
+  [[ "$have" =~ ^[0-9]+$ ]] || have=0
+  printf '%s' "$have"
+}
+
+# _anchor_refspecs BRANCH: the refspecs of BRANCH's safety anchor
+# that origin lacks, so a push of the branch carries them itself.
+_anchor_refspecs() {
+  local an have
+  have=$(git ls-remote origin 'refs/heads/safety/*' 2>/dev/null | cut -f2) || have=""
+  for an in $(rapid_anchor_refs "refs/heads/$1"); do
+    git rev-parse -q --verify "$an" >/dev/null || continue
+    grep -Fx -- "$an" <<<"$have" >/dev/null || printf '%s:%s\n' "$an" "$an"
+  done
+}
+
 # ---------------------------------------------------------------- status
 cmd_status() {
   local root b v rel l ahead behind json=false sep="" oa="" ob=""
@@ -432,6 +999,7 @@ esac
 case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
   branch) shift; cmd_branch "$@" ;;
+  land) shift; cmd_land "$@" ;;
   status) shift; cmd_status "$@" ;;
   -h|--help) usage 0 ;;
   *) usage 2 ;;

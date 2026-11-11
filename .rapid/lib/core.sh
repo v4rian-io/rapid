@@ -9,6 +9,13 @@ RAPID_REQ_PLACEHOLDER="State the requirement this branch meets, and how its test
 
 # Requirement files live at .rapid/requirements/<name>.md (rapid keeps to .rapid/).
 RAPID_REQ_DIR=.rapid/requirements
+# rapid_req_path REV NAME: the path of NAME's requirement file in REV (REV empty: the index);
+# returns 1, printing nothing, when REV holds none.
+rapid_req_path() {
+  local p="$RAPID_REQ_DIR/$2.md"
+  if git cat-file -e "$1:$p" 2>/dev/null; then printf '%s' "$p"; return 0; fi
+  return 1
+}
 
 rapid_die() { printf 'X rapid: %s\n' "$*" >&2; exit "${RAPID_RC:-1}"; }
 rapid_info() { printf '%s\n' "$*"; }
@@ -62,6 +69,63 @@ rapid_branch() { git symbolic-ref --short -q HEAD || [ $? = 1 ]; }
 
 # rapid_tmpdir NAME: a private temp directory honouring TMPDIR.
 rapid_tmpdir() { mktemp -d "${TMPDIR:-/tmp}/rapid-$1.XXXXXX"; }
+
+# rapid_private_wt NAME REV: a private detached work tree at REV in a new temp
+# directory; prints its path, rc 1 when it cannot be made. Every caller then
+# runs git -C on that path, so it must be a real work tree of its own: an
+# empty path (mktemp failed, as when the temp directory is swept under a
+# full disk), or a GIT_DIR exported by git to a hook, would make git -C act
+# on the caller's own work tree, detaching its branch and checking out other
+# commits over it.
+rapid_private_wt() {
+  local d
+  d=$(rapid_tmpdir "$1" 2>/dev/null) && [ -n "$d" ] && [ -d "$d" ] || return 1
+  git worktree add -q --detach "$d" "$2" >/dev/null 2>&1 || { rmdir "$d" 2>/dev/null || true; return 1; }
+  [ "$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$d" && pwd -P)" ] || return 1
+  # and git there uses that work tree's own git dir, not one GIT_DIR forces on it
+  [ "$(git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" != "$(git rev-parse --absolute-git-dir 2>/dev/null)" ] || return 1
+  # a heartbeat while rapid runs: the tree's root is touched every RAPID_BUSY_EVERY
+  # seconds (default 240), so a sweeper that wipes work trees idle for an hour
+  # (a gate running long under load writes nothing there) sees it in use. It looks
+  # every two seconds whether the tree and rapid are still there, so it ends with
+  # them: a heartbeat asleep for minutes after its tree is gone is a process too
+  # many when hundreds of trees come and go, and a full process table fails forks
+  ( hb=0; he="${RAPID_BUSY_EVERY:-240}"
+    while [ -d "$d" ] && kill -0 $$ 2>/dev/null; do
+      [ "$hb" -gt 0 ] && [ $((hb % he)) -ge 2 ] || touch "$d" 2>/dev/null || true
+      sleep 2; hb=$((hb + 2))
+    done ) >/dev/null 2>&1 &
+  printf '%s' "$d"
+}
+
+# rapid_clone_id: this clone's private random id (in the git dir, never pushed).
+# land's close note carries it, so pre-push trusts only notes this clone wrote.
+rapid_clone_id() {
+  local f; f="$(git rev-parse --git-common-dir)/rapid-clone-id"
+  [ -s "$f" ] || od -An -N8 -tx1 /dev/urandom | tr -d ' \n' > "$f"
+  cat "$f"
+}
+
+# A branch is the branch pool/v<year>.<series>/<number>.<kind>.<name>:
+# the series is the one the branch opened in, the number orders branches by
+# creation. A branch made by hand may come without a number
+# (pool/v<year>.<series>/<kind>.<name>); it takes one when it lands.
+RAPID_SERIES_RE='v[0-9]{4}\.[0-9]+'
+# rapid_branch_parse REF -> "kind name" for a branch; fails for any other name.
+rapid_branch_parse() {
+  local r="${1#refs/heads/}" v rest k s
+  case "$r" in
+    pool/*/*) ;;
+    *) return 1 ;;
+  esac
+  v=$(printf '%s' "$r" | cut -d/ -f2); rest=$(printf '%s' "$r" | cut -d/ -f3-)
+  [[ "$v" =~ ^$RAPID_SERIES_RE$ ]] || return 1
+  if [[ "$rest" =~ ^($RAPID_NUM_RE)\.([a-z]+)\.([a-z0-9-]+)$ ]]; then k="${BASH_REMATCH[2]}"; s="${BASH_REMATCH[3]}"
+  elif [[ "$rest" =~ ^([a-z]+)\.([a-z0-9-]+)$ ]]; then k="${BASH_REMATCH[1]}"; s="${BASH_REMATCH[2]}"
+  else return 1; fi
+  rapid_kind_ok "$k" && rapid_slug_ok "$s" || return 1
+  printf '%s %s\n' "$k" "$s"
+}
 # rapid_series: the series a branch opened now belongs to (the next version without its last number).
 rapid_series() {
   local v rel n
@@ -92,11 +156,21 @@ rapid_branch_number() {
   case "$n" in *.*) n="${n%%.*}"; [[ "$n" =~ ^$RAPID_NUM_RE$ ]] && printf '%s' "$n" ;; esac
   return 0
 }
+
+# A branch is pool/v<series>/<number>.<kind>.<name>; one never
+# landed simply stays there (a branch not landed yet), its anchor kept forever.
+# rapid_branch_open REF: 0 when REF names an open branch.
+rapid_branch_open() { case "${1#refs/heads/}" in pool/*/*) return 0 ;; esac; return 1; }
 # RAPID_POOL_NS: the ref namespace of branches.
 RAPID_POOL_NS="refs/heads/pool"
 
 rapid_kind_ok() { case " $RAPID_KINDS " in *" $1 "*) return 0 ;; esac; return 1; }
 rapid_slug_ok() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]{1,47}$ ]]; }
+
+# rapid_trailer COMMIT KEY: the value of trailer KEY in COMMIT's message.
+rapid_trailer() {
+  git log -1 --format=%B "$1" | git interpret-trailers --parse | sed -nE "s/^$2: (.*)$/\1/p" | sed -n 1p
+}
 
 # Safety anchors ("safety anchors stay forever"). Every branch keeps the commit
 # it forked from for the life of the repository, on a branch,
@@ -138,6 +212,17 @@ rapid_anchor_make() {
   fi
   printf '%s' "$ref"
 }
+# Vault refs. A safety anchor points at a branch's start; its vault branch at
+# its end: rapid land writes refs/heads/vault/v<series>/<name> on the branch's tip
+# as it landed (the merge's second parent), in the land's atomic push.
+# Like an anchor it stays forever: pre-push,
+# the agent guard and the rapid-vault-readonly ruleset refuse deleting or moving
+# one, and sync --dev publishes those of offline lands. A re-land keeps the
+# vault branch of the branch's first land.
+# rapid_vault_ref REF -> refs/heads/vault/v<series>/<name>.
+rapid_vault_ref() { local a; a=$(rapid_anchor_ref "$1"); printf 'refs/heads/vault/%s' "${a#refs/heads/safety/}"; }
+# rapid_anchor_refs REF: the refs that travel with branch REF: its anchor.
+rapid_anchor_refs() { rapid_anchor_ref "$1"; printf '\n'; }
 
 # rapid_lock_lift PATH WHAT: every rapid lock holds its holder's pid (a file whose first word is
 # it). 0 when PATH is free, or its holder is gone: the lock is then lifted and the lift logged in

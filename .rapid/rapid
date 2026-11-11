@@ -24,6 +24,7 @@
 #   rapid land --batch [-F BODY] [--dry-run]
 #                                      the same land into the open batch, the close deferred: local, offline,
 #                                      no gate, no push; repeat it for every branch but the last
+#   rapid land [FLAGS] BRANCH...           land each named branch in order; a conflicting one is skipped and named
 #   rapid land --prune                   put dev back where the batch began and drop the batch, the branches unchanged
 #   rapid land --pr [-F BODY]            open or update the branch's PR (body = the merge body); once it has
 #                                      land_approvals approvals, land it the same way (exit 3 while waiting)
@@ -429,6 +430,71 @@ _body_text() {
       e -= n; while (e > 0 && l[e] ~ /^[[:space:]]*$/) e--
       for (i = 1; i <= e; i++) print l[i] }'
 }
+# _land_rebase BRANCH NAME: rebase the checked-out stale BRANCH onto dev as rapid
+# sync does (preflight ref first, the register regenerated in each replayed
+# commit). On a conflict the rebase is undone, so the branch stays exactly as it
+# was, the conflicting files are written to
+# <git dir>/rapid/conflicts/<name> and named, land_on_conflict starts on them
+# in the background (args: branch, that file; RAPID_LAND_ON_CONFLICT overrides
+# the conf key), and land exits 4 so a driver goes on with the next branch.
+_land_rebase() {
+  local branch="$1" slug="$2" pf files cf hook
+  rapid_slug_landed "$slug" && rapid_die "name '$slug' already landed on dev (I7); $(_rename_hint)"
+  pf="refs/rapid/preflight/$slug/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+  git update-ref "$pf" HEAD
+  if ! git -c core.hooksPath=/dev/null rebase -q dev >/dev/null 2>&1; then
+    files=$(git diff --name-only --diff-filter=U | sed '/^$/d')
+    git rebase --abort >/dev/null 2>&1 || true
+    [ "$(git rev-parse HEAD)" = "$(git rev-parse "$pf")" ] || rapid_die "the rebase of $branch stopped and could not be undone; the branch as it was is kept at $pf"
+    [ -n "$files" ] || rapid_die "rebasing $branch onto dev stopped on a replayed commit; the branch is as it was; run 'rapid sync' to see it"
+    cf="$(git rev-parse --git-common-dir)/rapid/conflicts/$slug"; mkdir -p "$(dirname "$cf")"
+    printf '%s\n' "$files" > "$cf"
+    hook="${RAPID_LAND_ON_CONFLICT:-$(rapid_conf land_on_conflict "" 2>/dev/null || true)}"
+    [ -z "$hook" ] || ( sh -c "$hook" rapid-on-conflict "$branch" "$cf" </dev/null >/dev/null 2>&1 & )
+    RAPID_RC=4 rapid_die "$branch conflicts with dev ($(git rev-parse --short dev)) in: $(tr '\n' ' ' <<<"$files")
+  the branch is left as it was (also at $pf); resolve with 'rapid sync', then land again"
+  fi
+  rm -f "$(git rev-parse --git-common-dir)/rapid/conflicts/$slug"
+  rapid_info "-> rebased $branch onto dev ($(git rev-parse --short dev)); the previous tip is kept at $pf"
+}
+
+# _branch_ref NAME: the open branch NAME names: pool/v<series>/<number>.<kind>.<name>,
+# <kind>/<number>.<name>, or a bare name (with or without its number).
+_branch_ref() {
+  local n="${1#refs/heads/}" r
+  n="${n#pool/}"
+  r=$(git for-each-ref --format='%(refname:short)' refs/heads/pool/ \
+    | awk -v n="$n" '{ s = $0; sub(/^pool\//, "", s); k = s; sub(/\/.*/, "", k); b = s; sub(/^[^\/]*\//, "", b); x = b; sub(/^n[0-9]+\./, "", x); y = x; sub(/^[a-z]+\./, "", y)
+        if (s == n || b == n || x == n || y == n) print }' | sed -n 1p)
+  [ -n "$r" ] && printf '%s' "$r"
+}
+
+# _land_list [FLAGS] -- BRANCH...: land each branch in order, each by its own rapid
+# land on that branch. A conflict (exit 4) skips the branch and names it; any
+# other refusal is named too and the rest still land. Exit 0 when all landed,
+# 4 when only conflicts were skipped, else 1.
+_land_list() {
+  local fl=() p r rc worst=0 landed="" left="" refused=""
+  while [ "$1" != -- ]; do fl+=("$1"); shift; done; shift
+  [ $# -le 1 ] || [[ " ${fl[*]-} " != *" -F "* ]] || RAPID_RC=2 rapid_die "land: -F names one merge body; land a list without it, or one branch at a time"
+  cd "$(rapid_root)"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit them to the branch first"
+  for p in "$@"; do r=$(_branch_ref "$p") || rapid_die "land: no open branch named '$p'"; done
+  for p in "$@"; do
+    r=$(_branch_ref "$p")
+    git switch -q "$r" || { refused="$refused $r"; worst=1; continue; }
+    # checked afresh: a branch landed just before may have changed dev's framework
+    rc=0; RAPID_DEVEXEC= "$RAPID_SELF/rapid" land --batch ${fl[@]+"${fl[@]}"} || rc=$?
+    case "$rc" in
+      0) landed="$landed $r" ;;
+      4) left="$left $r"; [ "$worst" = 1 ] || worst=4 ;;
+      *) refused="$refused $r"; worst=1 ;;
+    esac
+  done
+  git switch -q dev 2>/dev/null || true
+  rapid_info "land: landed:${landed:- none}${left:+; left on a conflict:$left}${refused:+; refused:$refused}"
+  return "$worst"
+}
 
 # _land_msg BRANCH NEXT BODY_FILE TIP DEV_TIP GATES TREE_KEY TREE LNUM TICKET TEST DOCS EXTRA:
 # the merge message of branch tip TIP onto DEV_TIP, as rapid land writes it. GATES is the
@@ -587,6 +653,7 @@ cmd_land() {
   fi
   if [ ${#lbranches[@]} -gt 0 ]; then
     local lrc=0
+    _land_list ${lflags[@]+"${lflags[@]}"} -- "${lbranches[@]}" || lrc=$?
     return "$lrc"
   fi
   # rapid land never redoes what is done: with nothing left to land here (dev, or a branch
@@ -650,6 +717,7 @@ cmd_land() {
   # staleness: the branch must contain dev's tip, so the tested tree is the merge tree; land rebases a stale branch itself
   if [ "$(git merge-base dev HEAD)" != "$dev_tip" ]; then
     ! $dry || rapid_die "branch is behind dev ($(git rev-parse --short "$dev_tip")); rapid land rebases it (a dry run writes nothing)"
+    _land_rebase "$branch" "$slug"
   fi
   # every static check at once, before any gate: one refusal lists every violation
   out=$(_land_violations "$branch" "$dev_tip" "$body_file")
@@ -929,6 +997,9 @@ _pr_approvals() {
   [[ "$have" =~ ^[0-9]+$ ]] || have=0
   printf '%s' "$have"
 }
+
+# ---------------------------------------------------------------- sync
+_rename_hint() { printf "rename this branch with 'rapid branch --rename <new-name>', then rapid sync"; }
 
 # _anchor_refspecs BRANCH: the refspecs of BRANCH's safety anchor
 # that origin lacks, so a push of the branch carries them itself.

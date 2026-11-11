@@ -1,3 +1,17 @@
+# shellcheck shell=bash
+# devexec.sh - a branch is checked by dev's framework, never by its own copy (audit 4 H2).
+# Sourced first, before any other lib, by .rapid/rapid (for land), hooks/commit-msg and
+# hooks/pre-push. Bash 3.2 compatible; callers run under set -euo pipefail.
+#
+# A branch that rewrites the checks (lib/policy.sh, a hook, rapid itself) would otherwise
+# run its own rewritten checks on itself. rapid_devexec runs dev's committed .rapid
+# instead: exported once per dev framework tree into
+#   <git common dir>/rapid/devexec/<tree of dev:.rapid>/
+# (a cache only rapid writes; the agent guard denies hand writes under rapid/) and
+# exec'd with the same arguments, stdin and work tree. RAPID_DEVEXEC=<tree> marks the
+# dev-framework run, so it never re-execs. No dev branch (rapid setup, a fresh clone before
+# its first sync) or a running copy whose tracked files are dev's runs as it is.
+
 # rapid_devexec SELF ENTRY ARGS...: SELF is the running .rapid directory, ENTRY the
 # path of the running script inside it (rapid, hooks/commit-msg, hooks/pre-push).
 rapid_devexec() {

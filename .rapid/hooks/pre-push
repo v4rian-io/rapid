@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# pre-push - the client-side line for what reaches a shared remote. The
+# server rulesets (rapid setup --remote) are the authority on a forge; this
+# hook keeps honest pushes inside the same rules everywhere, offline remotes
+# included.
+#   - only dev, main, pool/v<series>/n<N>.<kind>.<name>, safety/... and vault/... branches
+#   - dev and main are never deleted or rewritten; every new first-parent
+#     commit on dev is a landed merge that passes I1 to I4 and I8
+#   - main only moves by release merges "[MERGE] dev into main: <version>"
+#     of a dev commit carrying release/<version>, with its tree (I5); main is
+#     production, so that tag is annotated and its tagger is an admin listed
+#     in .rapid/admins at the main it moves from (lib/policy.sh)
+#   - version and release tags are created once, never moved or deleted,
+#     and a version tag sits on the merge whose subject names it; a release
+#     tag, which opens the next series even without main, is the owner's
+#     like main itself
+#   - branch commits carry ruled messages and add no banned file, and a policy flip only in
+#     an admin's [MODE] commit (.rapid/admins); a branch is deleted only
+#     once dev holds it (land, or rapid branch --delete-landed after it): a branch never
+#     landed stays a branch
+#   - a branch push holds at most max_commits commits; it runs no gate (a branch
+#     push is transport: the close tests the tree it pushes, once)
+#   - safety anchors (refs/heads/safety/v<series>/<name>) and
+#     vault branches (refs/heads/vault/...) stay forever: never deleted
+#     or moved, and a branch push takes its anchor along (pushing it
+#     first when the remote lacks it); the anchor carries the branch's number
+set -euo pipefail
+# git runs the hook from the work tree's root, and from a linked work tree it
+# exports GIT_DIR: every git -C on a private work tree (the fast gate rerun on a
+# foreign dev merge) would then act on this work tree's index and HEAD. The root is
+# enough for git to find the repository.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# checked by dev's framework, never by the branch's own copy (lib/devexec.sh)
+. "$here/lib/devexec.sh"; rapid_devexec "$here" hooks/pre-push "$@"
+. "$here/lib/core.sh"
+for l in "$here"/lib/*.sh; do case "${l##*/}" in core.sh|devexec.sh) ;; *) . "$l" ;; esac; done
+zero=0000000000000000000000000000000000000000
+remote="${1:-origin}"
+fail() { echo "X pre-push: $*" >&2; exit 1; }
+lines=$(cat)
+# a batch is one push: while a batch is open nothing reaches a remote but the
+# close's own push (rapid land sets RAPID_BATCH_CLOSE_PUSH for it)
+bf="$(git rev-parse --git-common-dir)/rapid/batch"
+if [ -s "$bf" ] && [ "${RAPID_BATCH_CLOSE_PUSH:-}" != 1 ] && [ -n "$lines" ]; then
+  fail "a batch is open since dev $(git rev-parse --short "$(cat "$bf")" 2>/dev/null || true); rapid land publishes it in one push and nothing else is pushed until then (rapid land --prune drops the batch)"
+fi

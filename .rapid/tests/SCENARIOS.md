@@ -5,6 +5,7 @@ Run: `sh .rapid/tests/run.sh [--fast] [-j N] [FILTER]` (N at once; default RAPID
 
 | Scenario | Fast | Verifies |
 |---|---|---|
+| batch-close-failed-gates |  | rapid land --failed-gates-only runs again only the gates the previous close of this batch failed: the merges that close verified on their own tree are not verified again, a merge landed since is, and the failed gate of the final tree runs once. With no failed close of the batch on record it is refused by name and runs nothing. The default close runs every gate on every merge, after a failed close too. The close and the doctor print their progress live on stderr: one counted line per merge. |
 | batch-close-marker |  | a close removes only its own marker: the marker of a close under test carries that close's own id. An older close that ends while a newer close holds the batch leaves the newer marker in place, publishes nothing in its name and stops, so the newer close alone answers for the batch. |
 | batch-close-one-gate |  | batch-close-one-gate: rapid land runs one gate on the batch's final tree, gates_full, never the |
 | batch-land-local |  | batch-land-local: a plain rapid land always lands into the open batch: five branches land with no gate run and no push, offline; one rapid land gates the final tree and pushes it all in one push; a close with no batch open says so. |

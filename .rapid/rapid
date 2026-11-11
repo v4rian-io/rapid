@@ -527,6 +527,42 @@ _close_finish() {
   printf '%s\n' "$branches"
 }
 
+# _close_broke START TIP LOG CMD: after a failed close, name the branch that broke
+# the batch. With one merge in the batch it is that branch; else the gate runs on
+# the tree of every earlier batch merge, all at once (each in a private work
+# tree, narrowed to the failing scenarios the log names: RAPID_TEST_ONLY), and
+# the first merge whose tree fails is the one that broke it. The final tree is not tested
+# again: its result is the close's own.
+_close_broke() {
+  local start="$1" tip="$2" log="$3" cmd="$4" only m d out first="" merges pids="" pid
+  merges=$(git rev-list --reverse --first-parent "$start..$tip")
+  only=$(sed -nE 's/^---- .*\(failed:([^)]*)\)$/\1/p' "$log" 2>/dev/null | tail -n 1)
+  if [ "$(printf '%s\n' "$merges" | wc -l | tr -d ' ')" -gt 1 ]; then
+    out=$(rapid_tmpdir broke)
+    # the private work trees are made one after another (git adds one work tree at a time);
+    # the gate then runs in all of them at once
+    for m in $merges; do
+      [ "$m" != "$tip" ] || continue
+      d=$(rapid_private_wt broke "$m") && printf '%s\n' "$d" > "$out/$m.wt" || true
+    done
+    for m in $merges; do
+      [ "$m" != "$tip" ] || continue
+      ( d=$(cat "$out/$m.wt" 2>/dev/null || true); [ -n "$d" ] || exit 0
+        if (cd "$d" && RAPID_TEST_ONLY="$only" RAPID_TEST_ON_FAIL="" sh -c "$cmd") >/dev/null 2>&1; then echo 0 > "$out/$m"; else echo 1 > "$out/$m"; fi
+        git worktree remove --force "$d" >/dev/null 2>&1 || true ) &
+      pids="$pids $!"
+    done
+    for pid in $pids; do wait "$pid" 2>/dev/null || true; done
+    for m in $merges; do
+      if [ "$m" = "$tip" ] || [ "$(cat "$out/$m" 2>/dev/null || echo 0)" = 1 ]; then first="$m"; break; fi
+    done
+    rm -rf "$out"
+  else
+    first="$merges"
+  fi
+  rapid_info "broke the close: $(rapid_subject_branch "$(git log -1 --format=%s "$first")") ($(rapid_version_of "$first"), merge $(git rev-parse --short "$first")) is the first batch merge whose tree fails the gate${only:+; failing:$only}"
+}
+
 # _close_each START TIP: the cheap test of every merge of the batch. gates_each runs on the
 # own tree of each batch merge, all merges at once, each in a private work tree; its record
 # (command, exit code, duration, log tail) joins the gate log of that merge. Prints the
@@ -655,6 +691,7 @@ _batch_close() {
       # a failed close keeps the batch: dev, its tags and the branches stay, the branch that broke the close is named,
       # and the fix lands as one more branch before the next close (the fixer hook test_on_fail
       # started on each failing scenario the moment it failed)
+      _close_broke "$start" "$tip" "$grec/$g.log" "$cmd"
       rapid_die "the batch gate $g fails on the final tree; nothing was pushed and the batch stays open: land the fix as one more branch, then rapid land again (rapid land --prune puts dev back at $(git rev-parse --short "$start"))"
     fi
     # the batch's one test is the gate log of its last merge, the final tree it ran on

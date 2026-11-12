@@ -35,6 +35,8 @@
 #   rapid land --prune                   put dev back where the batch began and drop the batch, the branches unchanged
 #   rapid land --pr [-F BODY]            open or update the branch's PR (body = the merge body); once it has
 #                                      land_approvals approvals, land it the same way (exit 3 while waiting)
+#   rapid sync [--push]                  rebase the current branch onto dev behind a preflight ref (local only;
+#                                      --push then lease-pushes the branch to origin)
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
 #                                      I1 to I9, in full only after the last merge this clone verified (a note in
@@ -327,6 +329,50 @@ _branch_number_of() {
   printf '%s' "$num"
 }
 
+# Sets RAPID_OFFLINE=1 when origin is configured but unreachable. dev moves
+# through _move_branch, so a work tree that has dev checked out (this one or
+# a linked one) follows it instead of keeping the old files staged against
+# the new tip, which would stage the reversal of every coworker's land.
+RAPID_OFFLINE=0
+# _incoming_problems FROM TO: one line per first-parent commit of FROM..TO
+# (origin's dev arriving) that rapid land did not make: its sha, author and
+# the first invariant it breaks (rapid_check_merge, I1 to I4 and I8). When
+# local and origin dev diverged, origin's version tags sit in
+# refs/rapid/origin-tags (a local tag of the same name names the local merge),
+# so a merge carrying one there does not count as untagged.
+_incoming_problems() {
+  local c v rel out
+  for c in $(git rev-list --first-parent --reverse "$1..$2"); do
+    read -r v rel <<<"$(rapid_version_last "$c^1")"
+    out=$(rapid_check_merge "$c" "$v" "$rel" | grep -v '^OK ' || true)
+    if [ -n "$(git for-each-ref --points-at "$c" --format=x 'refs/rapid/origin-tags/v*')" ]; then
+      out=$(grep -v '^I2 .* carries 0 version tags' <<<"$out" || true)
+    fi
+    out=$(sed -n 1p <<<"$out")
+    [ -z "$out" ] || printf 'origin dev holds %s by %s, which rapid land did not make: %s\n' \
+      "$(git rev-parse --short "$c")" "$(git log -1 --format='%an <%ae>' "$c")" "$out"
+  done
+}
+# _verify_incoming FROM TO: never build on an unverified dev; local dev stays.
+_verify_incoming() {
+  local out; out=$(_incoming_problems "$1" "$2")
+  [ -z "$out" ] || rapid_die "$(sed -n 1p <<<"$out"); local dev stays at $(git rev-parse --short dev). Tell the owner; do not build on it"
+}
+_sync_dev_from_origin() {
+  rapid_has_remote || return 0
+  git fetch -q origin '+refs/heads/dev:refs/remotes/origin/dev' 2>/dev/null || { RAPID_OFFLINE=1; rapid_warn "origin unreachable; working offline on local dev"; return 0; }
+  local o d; o=$(git rev-parse -q --verify refs/remotes/origin/dev) || return 0
+  d=$(git rev-parse dev)
+  if git merge-base --is-ancestor dev "$o"; then
+    if [ "$d" != "$o" ] && [ "${RAPID_DRY:-0}" = 1 ]; then
+      rapid_die "dry run: origin's dev ($(git rev-parse --short "$o")) is ahead of local dev, and a dry run never moves dev; run 'rapid sync --dev' first, then the dry run"
+    fi
+    [ "$d" = "$o" ] || { _verify_incoming "$d" "$o"; _move_branch dev "$o" "$d"; rapid_info "dev fast-forwarded to origin ($(git rev-parse --short "$o"))"; }
+  elif ! git merge-base --is-ancestor "$o" dev; then
+    RAPID_RC=1 rapid_die "local dev and origin dev diverged; run 'rapid sync --dev' to re-land local merges"
+  fi
+}
+
 cmd_branch() {
   case "${1:-}" in
     ""|-h|--help) usage 2 ;;
@@ -346,6 +392,7 @@ cmd_branch() {
   root=$(rapid_root); cd "$root"
   git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
   [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit or stash them first"
+  _sync_dev_from_origin
   # a work tree that could not follow dev would carry its old files into the branch as staged changes
   [ -z "$(git status --porcelain --untracked-files=no)" ] \
     || rapid_die "dev moved under this work tree and it could not follow (see above); catch it up, then rapid branch again"
@@ -1163,6 +1210,7 @@ cmd_land() {
   set -- $ks; kind="$1"; slug="$2"
   [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit them to the branch first"
   git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
+  _sync_dev_from_origin
   # a number another clone published first: the branch, still unpublished, takes the next one
   $dry || branch=$(_branch_renumber_taken "$branch" "$kind" "$slug")
   dev_tip=$(git rev-parse dev)
@@ -1499,6 +1547,49 @@ _anchor_refspecs() {
   done
 }
 
+# rapid sync: bring the current branch onto dev's tip. The branch tip is kept
+# first under refs/rapid/preflight/<name>/<stamp>, the branch is rebased onto dev
+# (dev first fast-forwarded from origin). sync never pushes: with --push the
+# branch then goes to origin with a lease on the copy origin had (or is created).
+cmd_sync() {
+  local push=false
+  local root branch ks kind slug pf old
+  root=$(rapid_root); cd "$root"
+  branch=$(rapid_branch)
+  ks=$(rapid_branch_parse "$branch") || rapid_die "sync runs on a pool/v<series>/<number>.<kind>.<name> branch (on '${branch:-detached}'); use 'rapid sync --dev' for dev"
+  set -- $ks; kind="$1"; slug="$2"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit them to the branch first"
+  _sync_dev_from_origin
+  rapid_slug_landed "$slug" && rapid_die "name '$slug' already landed on dev (I7); $(_rename_hint "$branch" "$kind" "$slug")"
+  branch=$(_branch_renumber_taken "$branch" "$kind" "$slug")
+  pf="refs/rapid/preflight/$slug/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+  git update-ref "$pf" HEAD
+  if [ "$(git merge-base dev HEAD)" = "$(git rev-parse dev)" ]; then
+    rapid_info "branch already contains dev ($(git rev-parse --short dev)); nothing to rebase"
+  elif ! git -c core.hooksPath=/dev/null rebase -q dev >/dev/null 2>&1; then
+    rapid_die "sync stopped on a conflict in: $(git diff --name-only --diff-filter=U | tr '\n' ' ')
+  resolve the files, git add them, git rebase --continue, then rapid sync again;
+  or git rebase --abort to stop. The branch as it was is kept at $pf
+  (git reset --hard $pf brings it back)."
+  else
+    rapid_info "branch rebased onto dev ($(git rev-parse --short dev)); the previous tip is kept at $pf"
+  fi
+  # pushing is transport and never implied: only --push sends the branch
+  if $push; then
+    rapid_has_remote || rapid_die "sync --push: no origin to push to"
+    old=$(git ls-remote origin "refs/heads/$branch" | cut -f1) || rapid_die "sync --push: origin is unreachable; the branch stays local"
+    if [ "$old" != "$(git rev-parse HEAD)" ]; then
+      # the branch goes with its safety anchor and its number in one push, so the pre-push
+      # hook has no anchor left to push while this push is open
+      # shellcheck disable=SC2046
+      git push -q --atomic --force-with-lease="refs/heads/$branch:$old" origin "HEAD:refs/heads/$branch" $(_anchor_refspecs "$branch") \
+        || rapid_die "origin refused $branch (its reason is above); if origin's copy moved, fetch and compare before pushing"
+      if [ -n "$old" ]; then old=$(git rev-parse --short "$old" 2>/dev/null || printf '%s' "${old:0:7}"); else old="<none>"; fi
+      rapid_info "pushed $branch (lease on $old)"
+    fi
+  fi
+}
+
 # _gates_notes_in: take origin's refs/notes/gates into the local notes before
 # a land adds to them, so the atomic push only ever fast-forwards the ref (an
 # offline land's notes are merged in, never dropped). Without origin, a no-op.
@@ -1622,6 +1713,7 @@ cmd_doctor() {
   for k in main dev; do git rev-parse -q --verify "refs/heads/$k" >/dev/null || { rapid_info "doctor: no $k branch"; bad=1; }; done
   # origin's dev as last fetched: every commit this clone would take must be one rapid land made
   if rapid_has_remote && git rev-parse -q --verify refs/remotes/origin/dev >/dev/null && git rev-parse -q --verify refs/heads/dev >/dev/null; then
+    out=$(_incoming_problems dev refs/remotes/origin/dev)
     if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/doctor: /'; bad=1; fi
   fi
   # landed branches an admin has not deleted yet: reported, not a failure
@@ -1682,6 +1774,7 @@ case "${1:-}" in
   branch) shift; cmd_branch "$@" ;;
   check) shift; cmd_check "$@" ;;
   land) shift; cmd_land "$@" ;;
+  sync) shift; cmd_sync "$@" ;;
   status) shift; cmd_status "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   -h|--help) usage 0 ;;

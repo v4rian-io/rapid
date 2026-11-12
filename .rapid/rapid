@@ -36,6 +36,13 @@
 #   rapid land --pr [-F BODY]            open or update the branch's PR (body = the merge body); once it has
 #                                      land_approvals approvals, land it the same way (exit 3 while waiting)
 #   rapid status [--json]                where you are, open branches, last version
+#   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
+#                                      I1 to I9, in full only after the last merge this clone verified (a note in
+#                                      its git dir; a moved dev, changed tags or a changed verifier walk all);
+#                                      --all: every merge in full; --since: full merge checks only after REV
+#   rapid doctor --history-only          invariants I1 to I9 only (CI: no hooks on the runner);
+#                                      the merges are checked at once, one worker per core (RAPID_HISTORY_JOBS)
+#   rapid doctor --verify [SINCE]         run again, on the own tree of each merge, what its test record names (after SINCE)
 #   rapid -h | --help
 #
 # kinds: feature fix r&d refactor docs test. names: a-z, 0-9 and -, 2 to 48 chars.
@@ -1543,6 +1550,115 @@ cmd_status() {
   [ -z "$ll" ] || rapid_info "landed, still on origin (an admin deletes them with rapid branch --delete-landed): $(tr '\n' ' ' <<<"$ll")"
 }
 
+# ---------------------------------------------------------------- doctor
+# _agent_guard_installed: 0 when the agent guard is installed for Claude Code
+# (agent/install records the install in <claude home>/hooks/rapid/.install.json).
+_agent_guard_installed() { [ -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/rapid/.install.json" ]; }
+
+cmd_doctor() {
+  # --verbose, wherever it stands: the walk prints its progress lines
+  local va vrest=(); for va in "$@"; do if [ "$va" = --verbose ]; then export RAPID_VERBOSE=1; else vrest+=("$va"); fi; done; set -- ${vrest[@]+"${vrest[@]}"}
+  local history=false all=false root bad=0 hp out k email ck rec=false
+  [ "${1:-}" = "--history" ] && history=true
+  if [ "${2:-}" = "--since" ]; then [ -n "${3:-}" ] || RAPID_RC=2 rapid_die "--since needs a revision"; export RAPID_HISTORY_SINCE="$3"; fi
+  if [ "${2:-}" = "--all" ]; then all=true; fi
+  [ "${1:-}" != "--all" ] || RAPID_RC=2 rapid_die "--all goes with --history: rapid doctor --history --all"
+  root=$(rapid_root); cd "$root"
+  if [ "${1:-}" = "--verify" ]; then
+    # the stored gate log of each merge, beside the rerun below (refs/notes/gates, written by rapid land)
+    git fetch -q origin "+refs/notes/gates:refs/rapid/gates-origin" 2>/dev/null && { git rev-parse -q --verify refs/notes/gates >/dev/null || git update-ref refs/notes/gates refs/rapid/gates-origin; } || true
+    local gm groot gr
+    groot=$(rapid_dev_root dev)
+    case "${2:-}" in ""|0000000000000000000000000000000000000000) gr="$groot..dev" ;; *) gr="$2..dev" ;; esac
+    for gm in $(git rev-list --first-parent --reverse $gr); do
+      [ "$gm" = "$groot" ] && continue
+      if git notes --ref=gates show "$gm" >/dev/null 2>&1; then
+        rapid_info "stored gate log of $(git rev-parse --short "$gm") ($(rapid_version_of "$gm")): $(git notes --ref=gates show "$gm" | awk -F= '/^gate=/{g=$2} /^exit=/{printf "%s%s=exit %s", s, g, $2; s=", "} /^duration=/{printf " in %s", $2}')"
+      else
+        rapid_info "stored gate log of $(git rev-parse --short "$gm") ($(rapid_version_of "$gm")): none (landed before the archive)"
+      fi
+    done
+    local rapid_live="${RAPID_VERBOSE:-}"
+    out=$(rapid_verify_range "${2:-}" dev)
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/doctor: /'; return 1; fi
+    # a merge that ran no gate passes trivially: say how many, never "every merge's gates pass" alone
+    local ng; ng=$(rapid_ungated_range "${2:-}" dev)
+    if [ -n "$ng" ]; then
+      rapid_info "doctor: ok, but $(wc -w <<<"$ng" | tr -d ' ') merge(s) carry no gate:$(printf ' %s' $ng)"; return 0
+    fi
+    rapid_info "doctor: ok (every merge's gates pass again on its own tree)"; return 0
+  fi
+  # the history check reads the gate log: bring the one origin holds first
+  if ${history:-false} || [ "${1:-}" = "--history-only" ]; then ( _gates_notes_in ) >/dev/null 2>&1 || true; fi
+  if [ "${1:-}" = "--history-only" ]; then
+    local rapid_live="${RAPID_VERBOSE:-}"
+    out=$(RAPID_CONF_REV="" rapid_history_check dev main)
+    rapid_exceptions dev | sed 's/^/doctor: exceptions: /'
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/doctor: /'; return 1; fi
+    rapid_info "doctor: ok (history I1-I9 hold)"; return 0
+  fi
+  if $inst; then
+    # an installed repository (lib/pin.sh): its hooks are the stubs in the git directory
+    hp=$(git config --get core.hooksPath || true)
+  elif [ "${1:-}" = "--fix" ]; then
+    git config core.hooksPath .rapid/hooks && rapid_info "doctor --fix: core.hooksPath set to .rapid/hooks"
+    for k in .rapid/hooks/* .rapid/rapid; do [ -x "$k" ] || { chmod +x "$k" && rapid_info "doctor --fix: made $k executable"; }; done
+  fi
+  hp=$(git config --get core.hooksPath || true)
+  $inst || [ "$hp" = .rapid/hooks ] || { rapid_info "doctor: core.hooksPath is '${hp:-unset}', want .rapid/hooks (rapid setup)"; bad=1; }
+  $inst || [ -x .rapid/hooks/commit-msg ] || { rapid_info "doctor: .rapid/hooks/commit-msg missing or not executable"; bad=1; }
+  $inst || for k in .rapid/hooks/*; do [ -x "$k" ] || { rapid_info "doctor: $k is not executable"; bad=1; }; done
+  for k in land_who land_list max_commits gates_fast gates_full gates_release; do
+    ( rapid_conf "$k" >/dev/null ) 2>/dev/null || { rapid_info "doctor: conf key $k is set more than once"; bad=1; }
+  done
+  out=$(RAPID_CONF_REV="" rapid_gate_missing "$root" 2>/dev/null || true)
+  if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/doctor: /'; bad=1; fi
+  ( rapid_policy_max_commits >/dev/null ) 2>/dev/null || { rapid_info "doctor: max_commits is invalid"; bad=1; }
+  # an agent session without the agent guard still never releases (rapid release),
+  # but nothing stops its destructive commands: say so
+  local sm; if sm=$(rapid_agent_session); then
+    _agent_guard_installed || rapid_warn "doctor: this is an agent session ($sm is set) and the rapid agent guard is not installed; run rapid setup --agent"
+  fi
+  for k in main dev; do git rev-parse -q --verify "refs/heads/$k" >/dev/null || { rapid_info "doctor: no $k branch"; bad=1; }; done
+  # origin's dev as last fetched: every commit this clone would take must be one rapid land made
+  if rapid_has_remote && git rev-parse -q --verify refs/remotes/origin/dev >/dev/null && git rev-parse -q --verify refs/heads/dev >/dev/null; then
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/doctor: /'; bad=1; fi
+  fi
+  # landed branches an admin has not deleted yet: reported, not a failure
+  local ll; ll=$(_landed_live)
+  [ -z "$ll" ] || rapid_info "doctor: landed branch(es) still on origin, for an admin to delete (rapid branch --delete-landed): $(tr '\n' ' ' <<<"$ll")"
+  # branches never landed stay branches, their anchors kept: reported, not a failure
+  local ul; ul=$(_not_landed)
+  [ -z "$ul" ] || rapid_info "doctor: branches not landed yet: $(tr '\n' ' ' <<<"$ul")"
+  if $history; then
+    # what the rules let land as an exception, by kind, from one command (information, not a failure)
+    rapid_exceptions dev | sed 's/^/doctor: exceptions: /'
+    # the checkpoint: start after the last merge this clone fully verified,
+    # unless --since or --all says otherwise or the note is no longer trusted
+    # (lib/history.sh, rapid_history_checkpoint, says when and why)
+    if [ -n "${RAPID_HISTORY_SINCE:-}" ]; then
+      :
+    elif $all; then
+      rapid_info "doctor: history: every merge in full (--all)"; rec=true
+    else
+      ck=$(rapid_history_checkpoint dev); rec=true
+      case "$ck" in
+        "from "*)
+          export RAPID_HISTORY_SINCE="${ck#from }"
+          ck=$(rapid_version_of "$RAPID_HISTORY_SINCE"); [ -n "$ck" ] || ck=$(git rev-parse --short "$RAPID_HISTORY_SINCE")
+          rapid_info "doctor: history: merges after $ck in full, the ones up to it verified by this clone (--all walks every merge)" ;;
+        *) rapid_info "doctor: history: every merge in full (${ck#full })" ;;
+      esac
+    fi
+    local rapid_live="${RAPID_VERBOSE:-}"
+    out=$(RAPID_CONF_REV="" rapid_history_check dev main)
+    if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/doctor: /'; bad=1
+    elif $rec; then rapid_history_record dev; fi
+  fi
+  [ "$bad" = 0 ] && rapid_info "doctor: ok$($history && echo ' (history I1-I9 hold)')"
+  return "$bad"
+}
+
 # A clone that never ran rapid setup has no hooks and maybe no dev: the verbs
 # that write (branch, commit, land, sync, release) refuse with the one command to run,
 # instead of working unguarded or failing with a raw git error. check, bisect
@@ -1567,6 +1683,7 @@ case "${1:-}" in
   check) shift; cmd_check "$@" ;;
   land) shift; cmd_land "$@" ;;
   status) shift; cmd_status "$@" ;;
+  doctor) shift; cmd_doctor "$@" ;;
   -h|--help) usage 0 ;;
   *) usage 2 ;;
 esac

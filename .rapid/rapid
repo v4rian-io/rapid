@@ -14,6 +14,8 @@
 #                                      it also writes the safety anchor safety/v<series>/n<N>.<kind>.<name> (kept forever)
 #   rapid check [--gate NAME] [--each]   run a gate on the work tree, or the commit audit and the fast gate on
 #                                      every branch commit
+#   rapid check --reqs [--save [FILE]]   print the requirements register, built from .rapid/requirements/ on the spot
+#                                      (--save writes it: .rapid/REQUIREMENTS.md, or FILE)
 #   rapid check --audit [REV]            the commit audit (message rules, joiners, Cause and Fix,
 #                                      size, a behaviour change with its test) on the branch, or a merge's branch
 #   rapid land [-F BODY] [--dry-run] [--failed-gates-only] [--verbose]
@@ -426,6 +428,7 @@ cmd_check() {
       --gate) gate="${2:-}"; shift 2 ;;
       --each) each=true; shift ;;
       --audit) shift; _check_audit_cmd "$@"; return ;;
+      --reqs) shift; _check_reqs "$@"; return ;;
       *) RAPID_RC=2 rapid_die "check: unknown argument $1" ;;
     esac
   done
@@ -459,6 +462,26 @@ _check_audit_cmd() {
     RAPID_CONF_REV=dev _check_audit "$(git merge-base dev "$r")" "$r" || rapid_die "check --audit: a branch commit fails the commit audit (named above)"
   fi
   rapid_info "ok: every commit passes the commit audit"
+}
+
+# _check_reqs [--save [FILE]]: rapid check --reqs. Prints the requirements register, built on
+# the spot from the requirement files of the work tree; --save writes it to FILE
+# (default .rapid/REQUIREMENTS.md) and says where. Nothing else holds a register.
+_check_reqs() {
+  local d out save="" file=""
+  cd "$(rapid_root)"
+  if [ "${1:-}" = --save ]; then save=1; file="${2:-.rapid/REQUIREMENTS.md}"; shift; [ $# = 0 ] || shift; fi
+  [ $# = 0 ] || RAPID_RC=2 rapid_die "check --reqs takes only --save [FILE]"
+  d=$(rapid_tmpdir reqs)
+  rapid_reqs_gather_tree "$d"
+  out=$(rapid_reqs_render "$d") || { rm -rf "$d"; rapid_die "the requirement files break the register model (above)"; }
+  rm -rf "$d"
+  if [ -n "$save" ]; then
+    mkdir -p "$(dirname "$file")"; printf '%s\n' "$out" > "$file"
+    rapid_info "the requirements register is saved in $file"
+  else
+    printf '%s\n' "$out"
+  fi
 }
 
 

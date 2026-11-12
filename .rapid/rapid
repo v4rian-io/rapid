@@ -1158,6 +1158,7 @@ cmd_land() {
   $dry || branch=$(_branch_renumber_taken "$branch" "$kind" "$slug")
   dev_tip=$(git rev-parse dev)
   export RAPID_CONF_REV="$dev_tip"
+  out=$(rapid_policy_may_land) || rapid_die "policy: $out"
   # no gate is never silent: an unset full gate is refused, an explicit none is said out loud.
   # A branch keeps a gates_full in its own conf; one that sets it lands even on a dev that has none.
   local lfull; lfull=$(RAPID_CONF_REV=HEAD rapid_conf gates_full "")

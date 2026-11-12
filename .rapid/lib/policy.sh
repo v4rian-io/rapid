@@ -51,6 +51,19 @@
 # the defaults, named once: lint/docs.sh checks RULES' policy table against them
 RAPID_MAX_COMMITS_DEFAULT=20
 
+rapid_policy_may_land() {
+  local who email list
+  who=$(rapid_conf land_who anyone)
+  email=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -E 's/.*<([^>]*)>.*/\1/')
+  case "$who" in
+    anyone) return 0 ;;
+    list)
+      list=$(rapid_conf land_list "")
+      if [ -n "$email" ] && tr ',' '\n' <<<"$list" | grep -Fx -- "$email" >/dev/null; then return 0; fi
+      echo "'${email:-<no identity>}' is not in land_list (land_who=list)"; return 1 ;;
+    *) echo "land_who='$who' is not anyone or list"; return 1 ;;
+  esac
+}
 
 # rapid_agent_session: prints the variable that marks this process as an AI
 # agent session and returns 0, or returns 1. Claude Code sets CLAUDECODE and

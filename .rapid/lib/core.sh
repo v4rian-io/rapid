@@ -17,6 +17,11 @@ rapid_req_path() {
   return 1
 }
 
+# Named rules, every one on from the first merge.
+RAPID_RULES="red-test commit-audit commit-body branch-number no-coauthor"
+# rapid_rule_on NAME: 0 when rule NAME applies here.
+rapid_rule_on() { case " $RAPID_RULES " in *" $1 "*) return 0 ;; esac; return 1; }
+
 rapid_die() { printf 'X rapid: %s\n' "$*" >&2; exit "${RAPID_RC:-1}"; }
 rapid_info() { printf '%s\n' "$*"; }
 rapid_warn() { printf '! rapid: %s\n' "$*" >&2; }

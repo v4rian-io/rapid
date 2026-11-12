@@ -101,6 +101,20 @@ rapid_path_in() {
   return 1
 }
 
+# rapid_verified_signer tag|commit OBJECT REV: who signed OBJECT, as git verifies it: the
+# principal (ssh) or the GOODSIG email (gpg); empty without a good signature. The keys come
+# from .rapid/signers committed at REV when it exists, else from git's own config.
+rapid_verified_signer() {
+  local af="" raw c=()
+  if git cat-file -e "$3:.rapid/signers" 2>/dev/null; then
+    af=$(mktemp "${TMPDIR:-/tmp}/rapid-signers.XXXXXX"); git show "$3:.rapid/signers" > "$af"
+    c=(-c "gpg.ssh.allowedSignersFile=$af")
+  fi
+  raw=$(git ${c[@]+"${c[@]}"} "verify-$1" --raw "$2" 2>&1) || raw=""
+  [ -z "$af" ] || rm -f "$af"
+  sed -nE 's/^Good "git" signature for ([^ ]+) with .*/\1/p; s/^\[GNUPG:\] GOODSIG [^ ]+ .*<([^>]+)>.*/\1/p' <<<"$raw" | sed -n 1p
+}
+
 # rapid_docs_named BASE TIP REQFILE: with docs_rules set, a branch that changes
 # code matching a rule's code glob changes a doc matching its doc glob, or
 # its requirement says "Docs: none (<reason>)". Prints the merge trailer
@@ -214,4 +228,26 @@ rapid_check_each() {
   done
   git worktree remove --force "$wt" >/dev/null 2>&1 || true
   return "$fails"
+}
+
+# rapid_flip_signer_problem [COMMIT]: an email is whatever its author types, so under
+# signed=required at RAPID_CONF_REV a policy flip is signed by an admin: empty when
+# signed=required is off, no admin is listed yet, or the verified signer of COMMIT
+# (rapid_verified_signer, keys from .rapid/signers at that revision) is an admin; else why.
+# commit-msg passes a probe commit signed with the key the commit will carry (none: no key signs).
+rapid_flip_signer_problem() {
+  local rev="${RAPID_CONF_REV:-HEAD}" admins signer=""
+  [ "$(rapid_conf signed optional)" = required ] || return 0
+  [ -z "${1:-}" ] || signer=$(rapid_verified_signer commit "$1" "$rev")
+  if [ -z "$signer" ]; then
+    echo "the policy flip carries no signature git verifies$(! git cat-file -e "$rev:.rapid/signers" 2>/dev/null || echo " against .rapid/signers on dev") (signed=required): an admin signs a policy flip"
+  elif ! grep -Fx -- "$signer" <<<"$admins" >/dev/null; then
+    echo "the policy flip is signed by '$signer': '$signer' is not an admin (.rapid/admins: $(tr '\n' ' ' <<<"$admins" | sed 's/ $//')); an admin flips policy"
+  fi
+}
+
+# rapid_pin_problem TEXT: empty when TEXT (a .rapid/version as committed or staged) pins one
+# version tag, or is gone; else the one line that says what it must hold.
+rapid_pin_problem() {
+  local p; p=$(sed -n 1p <<<"$1" | tr -d '[:space:]')
 }

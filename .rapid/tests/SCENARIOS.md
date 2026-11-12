@@ -33,6 +33,7 @@ Run: `sh .rapid/tests/run.sh [--fast] [-j N] [FILTER]` (N at once; default RAPID
 | land-remote |  | land with a remote: one atomic push carries dev, the tag and the branch deletion. |
 | lazy-docs |  | no lazy commit or requirement: with commit_body at its default and requirement_test=required, a bodiless [FIX] commit is refused at commit and, made past the hook, by land and I4; a subject repeated as the body does not count, a Cause: line then a Fix: line does; the requirement "fix the bug" is refused at land; a Test: naming a file the branch lacks is refused; a stated requirement with its test lands with a Test: trailer, and rapid branch --test writes the line. |
 | link-drop |  | the link drops between the merge and the push: nothing changes locally or on origin, and the next land resumes without a duplicate tag. |
+| marked-red | yes | a test-first commit marked Red: and followed by the green fix lands; a Red: commit at the branch tip does not. |
 | merge-tree-gate | yes | the full gate fails on the merge tree although every branch commit passes the fast gate: dev and the tags stay unchanged. |
 | message-rules | yes | commit-msg refusals: each rule refuses with its fix named and the subject help printed once with every tag, nothing is rewritten. |
 | no-coauthor |  | no Co-Authored-By trailer of any kind: a commit carrying one is refused at commit and, made past the hook, by land; a hand-made merge of one is flagged I4. |

@@ -390,6 +390,7 @@ rapid_history_check() {
   done <<<"$(git log --first-parent --format='%(trailers:key=Requirement,valueonly,separator=%x2C)%x09%s' "$dev" \
                | awk -F '\t' '$1 ~ /^[.]rapid\/requirements\// && $2 ~ /^\[MERGE\] pool\/[^ ]+ into dev: / { split($2, w, " "); sub(/^.*[.]/, "", w[2]); print w[2], $1 }')"
   # I3 over a batch: deferred gates are shown by the close record
+  rapid_batch_test_records "$dev"
   # I9
   rapid_reland_pending "$dev" | sed 's/^/I9 - re-land pending: /'
   [ ! -d "$(git rev-parse --git-path rapid-reland)" ] || echo "I9 - a rapid sync --dev re-land is half done; finish it with --continue or --abort"
@@ -429,6 +430,28 @@ rapid_exceptions() {
   for kind in bulk untested gate-change docs-none batch-close no-gate; do
     v=$(awk -v k="$kind" '$1 == k { printf " %s", $2 }' <<<"$out")
     [ -z "$v" ] || printf '%s: %s merge(s):%s\n' "$kind" "$(wc -w <<<"$v" | tr -d ' ')" "$v"
+  done
+}
+
+# rapid_batch_test_records [DEV]: a merge landed into a batch says "Gates: deferred to the close of batch
+# close <id>": no gate ran on its tree at the land. That test record holds once the last merge
+# of its batch carries the record of the close in its gate log (refs/notes/gates): the gate
+# that ran on the final tree, exit 0 (or the plain statement that no gate is configured). Prints "I3 <sha> <why>" for a batch with no such
+# record; the batch still open in this clone is exempt (its close has not run yet).
+rapid_batch_test_records() {
+  local dev="${1:-dev}" rows id last tree bf open=""
+  rows=$(git log --first-parent --reverse --format='%H %(trailers:key=Gates,valueonly,separator=%x20)' "$dev" \
+    | sed -nE 's/^([0-9a-f]+) deferred to the close of batch ([0-9a-f]+).*$/\2 \1/p')
+  [ -n "$rows" ] || return 0
+  bf="$(git rev-parse --git-common-dir)/rapid/batch"
+  [ ! -s "$bf" ] || open=$(cat "$bf")
+  awk '{ last[$1] = $2; if (!($1 in seen)) { seen[$1] = 1; order[++n] = $1 } } END { for (i = 1; i <= n; i++) print order[i], last[order[i]] }' <<<"$rows" \
+  | while read -r id last; do
+    [ -z "$open" ] || [ "$(git rev-parse -q --verify "$id^{commit}" 2>/dev/null || true)" != "$open" ] || continue
+    tree=$(git rev-parse "$last^{tree}")
+    git notes --ref=gates show "$last" 2>/dev/null \
+      | awk -v t="$tree" '/^close of batch [0-9a-f]+: gates on the final tree / { f = ($NF == t) } f && /^exit=(0|none \(no gate configured\))$/ { ok = 1 } END { exit !ok }' \
+      || echo "I3 $last batch $id has no passing close record in the gate log of its last merge: its merges defer their gates and none is shown to have run"
   done
 }
 

@@ -726,6 +726,7 @@ _batch_close() {
     _batch_rollback "$start" "$tip"
     rapid_die "origin's dev moved during the batch; local dev is back at $(git rev-parse --short "$start"), nothing was pushed: rapid sync in each branch, then land them again"
   fi
+  RAPID_OFFLINE=0 _gates_notes_in
   for c in $(git rev-list --first-parent "$o..$tip"); do v=$(rapid_version_of "$c"); [ -z "$v" ] || refs="$refs refs/tags/$v"; done
   git rev-parse -q --verify refs/notes/gates >/dev/null && refs="$refs refs/notes/gates:refs/notes/gates"
   have=$(git ls-remote origin 'refs/heads/safety/*' 'refs/heads/vault/*' 2>/dev/null | cut -f2) || have=""
@@ -1212,6 +1213,7 @@ $(sed 's/^/  - /' <<<"$out")"
     else printf 'gate=%s\nexit=none (no gate configured)\n\n' "$g" >> "$glog"; fi
   done
   fi
+  _gates_notes_in
   git notes --ref=gates add -f -F "$glog" "$merge" >/dev/null 2>&1 || rapid_die "could not write the gate log note on $(git rev-parse --short "$merge")"
   rm -f "$msg" "$glog"; [ -z "$gr" ] || rm -rf "$gr"
   # shellcheck disable=SC2086
@@ -1375,6 +1377,20 @@ _anchor_refspecs() {
     git rev-parse -q --verify "$an" >/dev/null || continue
     grep -Fx -- "$an" <<<"$have" >/dev/null || printf '%s:%s\n' "$an" "$an"
   done
+}
+
+# _gates_notes_in: take origin's refs/notes/gates into the local notes before
+# a land adds to them, so the atomic push only ever fast-forwards the ref (an
+# offline land's notes are merged in, never dropped). Without origin, a no-op.
+_gates_notes_in() {
+  rapid_has_remote && [ "${RAPID_OFFLINE:-0}" != 1 ] || return 0
+  git fetch -q origin "+refs/notes/gates:refs/rapid/gates-origin" 2>/dev/null || return 0
+  if ! git rev-parse -q --verify refs/notes/gates >/dev/null; then
+    git update-ref refs/notes/gates refs/rapid/gates-origin
+  elif ! git merge-base --is-ancestor refs/rapid/gates-origin refs/notes/gates; then
+    git notes --ref=gates merge -q -s cat_sort_uniq refs/rapid/gates-origin >/dev/null 2>&1 \
+      || rapid_die "the gate log notes of origin and this clone could not be merged; nothing changed"
+  fi
 }
 
 # ---------------------------------------------------------------- status

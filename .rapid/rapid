@@ -13,6 +13,7 @@
 #                                      (--test: the test file or scenario name that verifies it, as its Test: line);
 #                                      it also writes the safety anchor safety/v<series>/n<N>.<kind>.<name> (kept forever)
 #   rapid branch --rename NEW_NAME         give the current branch a new name (requirements file follows)
+#   rapid branch --delete-landed [BRANCH...]        an admin deletes landed branches still on origin (the forge lets only admins)
 #   rapid check [--gate NAME] [--each]   run a gate on the work tree, or the commit audit and the fast gate on
 #                                      every branch commit
 #   rapid check --reqs [--save [FILE]]   print the requirements register, built from .rapid/requirements/ on the spot
@@ -379,6 +380,7 @@ _sync_dev_from_origin() {
 cmd_branch() {
   case "${1:-}" in
     --rename) shift; _branch_rename "$@"; return ;;
+    --delete-landed) shift; _branch_delete_landed "$@"; return ;;
     ""|-h|--help) usage 2 ;;
   esac
   local kind="$1" slug="${2:-}" req="" ticket="" req_test="" root
@@ -499,6 +501,27 @@ _landed_live() {
     git cat-file -e "$sha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$sha" "$d" 2>/dev/null && printf '%s\n' "${ref#refs/heads/}"
   done
   return 0
+}
+
+# _branch_delete_landed [BRANCH...]: delete on origin each named branch, or every landed
+# branch still there, that dev holds. Only a repository admin may delete a branch
+# on a forge (rapid-branch-deletions); anyone else is refused there, and the branch
+# stays. A branch dev does not hold is never deleted: it stays a branch not landed yet.
+_branch_delete_landed() {
+  local root l live d n=0 bad=0
+  root=$(rapid_root); cd "$root"
+  rapid_has_remote || rapid_die "no origin; there is nothing to delete"
+  git fetch -q --no-tags origin '+refs/heads/dev:refs/remotes/origin/dev' 2>/dev/null || rapid_die "origin is unreachable; branch --delete-landed needs it"
+  live=$(_landed_live)
+  [ $# -gt 0 ] || set -- $live
+  for l in "$@"; do
+    l="${l#refs/heads/}"
+    grep -Fx -- "$l" <<<"$live" >/dev/null || { rapid_warn "$l is not a landed branch on origin; not deleted (a branch not landed yet stays)"; bad=1; continue; }
+    if git push -q origin ":refs/heads/$l" </dev/null 2>/dev/null; then n=$((n + 1)); rapid_info "deleted $l on origin"
+    else rapid_warn "origin refused to delete $l (only a repository admin may)"; bad=1; fi
+  done
+  rapid_info "branch --delete-landed: $n branch(es) deleted"
+  return "$bad"
 }
 
 # ---------------------------------------------------------------- check

@@ -1011,6 +1011,7 @@ _land_violations() {
     viol=$(rapid_msg_violations "$f"); rm -f "$f"
     [ -z "$viol" ] || echo "commit $sc breaks the message rules: $(tr '\n' ';' <<<"$viol")"
     viol=$(rapid_commit_smells "$c"); [ -z "$viol" ] || echo "commit $sc fails the commit audit: $(tr '\n' ';' <<<"$viol")"
+    viol=$(rapid_policy_flip_commit "$c"); [ -z "$viol" ] || echo "commit $sc: policy: $(tr '\n' ';' <<<"$viol")"
     viol=$(rapid_trailer "$c" Fixes)
     if [ -n "$viol" ]; then
       git rev-parse -q --verify "$viol^{commit}" >/dev/null && git merge-base --is-ancestor "$viol" "$dev_tip" \

@@ -204,6 +204,75 @@ rapid_main_check() {
   done
 }
 
+# The history checkpoint. After a doctor --history run in which every
+# invariant held, this clone records the dev tip it verified in a note inside
+# its git dir, <git common dir>/rapid-history-verified: never a tracked file,
+# never a ref, so never pushed, and one per clone (its worktrees share it).
+# The next run checks merges in full only after that tip (RAPID_HISTORY_SINCE);
+# the version chain before it and the whole-history checks (I5 to I9) still
+# run every time. The note is trusted only while all three still hold, else
+# the run walks every merge and says why (rapid_history_checkpoint):
+#   1. the recorded merge is on dev's first-parent line (hence an ancestor of
+#      dev): a rewritten or reset dev is walked in full;
+#   2. the v* and release/* tags reachable from it are the ones recorded: the
+#      version chain I2 reads from the skipped merges has not moved;
+#   3. the verifier is the one recorded (rapid_history_verifier): the running
+#      rapid and its lib/, the repository's conf and admins, and the gpg.*
+#      settings the signature check reads. A changed rule or config re-checks
+#      every merge.
+# rapid doctor --history --all ignores the note; --since REV and --history-only
+# never read or write it.
+
+# rapid_history_note: the note's path.
+rapid_history_note() { printf '%s/rapid-history-verified' "$(git rev-parse --git-common-dir)"; }
+
+# rapid_history_verifier: one hash of the verifier's own code and config.
+rapid_history_verifier() {
+  local d="${RAPID_SELF:-$(rapid_ns)}" r f
+  r=$(git rev-parse --show-toplevel 2>/dev/null || true); r="${r:+$r/.rapid}"; r="${r:-$d}"
+  # the code is the running tool's, the config the repository's (one directory in the framework's own repository)
+  { for f in "$d/rapid" "$d"/lib/*.sh; do
+      [ -f "$f" ] || continue
+      printf '== %s\n' "${f#"$d"/}"; cat "$f"
+    done
+    for f in "$r/conf" "$r/admins"; do
+      [ -f "$f" ] || continue
+      printf '== %s\n' "${f#"$r"/}"; cat "$f"
+    done
+    printf '== gpg\n'; git config --get-regexp '^gpg[.]' 2>/dev/null || true
+  } | git hash-object --stdin
+}
+
+# rapid_history_tags M: one hash of the v* and release/* tags reachable from M.
+rapid_history_tags() {
+  git for-each-ref --merged "$1" --format='%(refname) %(objectname)' 'refs/tags/v*' 'refs/tags/release/*' | git hash-object --stdin
+}
+
+# rapid_history_checkpoint [DEV]: "from <sha>" when the note may be trusted,
+# else "full <why>".
+rapid_history_checkpoint() {
+  local dev="${1:-dev}" f m
+  f=$(rapid_history_note)
+  [ -s "$f" ] || { echo "full no merge verified by this clone yet"; return 0; }
+  m=$(sed -nE 's/^merge=([0-9a-f]{40,64})$/\1/p' "$f" | sed -n 1p)
+  [ -n "$m" ] && git cat-file -e "$m^{commit}" 2>/dev/null || { echo "full the checkpoint note names no commit"; return 0; }
+  git rev-list --first-parent "$dev" | grep -Fx -- "$m" >/dev/null \
+    || { echo "full the recorded merge $(git rev-parse --short "$m") is no longer on $dev's first-parent line"; return 0; }
+  [ "tags=$(rapid_history_tags "$m")" = "$(sed -n '/^tags=/{p;q;}' "$f")" ] \
+    || { echo "full the version or release tags up to the recorded merge changed"; return 0; }
+  [ "verifier=$(rapid_history_verifier)" = "$(sed -n '/^verifier=/{p;q;}' "$f")" ] \
+    || { echo "full the verifier's code or config changed since the recorded run"; return 0; }
+  echo "from $m"
+}
+
+# rapid_history_record [DEV]: write the note for DEV's tip (after a clean run).
+rapid_history_record() {
+  local m f
+  m=$(git rev-parse "${1:-dev}^{commit}"); f=$(rapid_history_note)
+  printf 'merge=%s\ntags=%s\nverifier=%s\n' "$m" "$(rapid_history_tags "$m")" "$(rapid_history_verifier)" > "$f.tmp.$$"
+  mv -f "$f.tmp.$$" "$f"
+}
+
 # rapid_version_map: "<commit> <version>" for each commit a version tag names,
 # the tag rapid_version_of picks (the first well-formed v* in name order), from
 # one git call, so the whole-history walks run no git per merge.

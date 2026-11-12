@@ -37,6 +37,8 @@
 #                                      land_approvals approvals, land it the same way (exit 3 while waiting)
 #   rapid sync [--push]                  rebase the current branch onto dev behind a preflight ref (local only;
 #                                      --push then lease-pushes the branch to origin)
+#   rapid sync --dev [--continue|--abort] reconcile local dev with origin: fast-forward, publish, or re-land
+#                                      (a stopped re-land resumes with --continue; --abort keeps the rest as branches not landed yet)
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
 #                                      I1 to I9, in full only after the last merge this clone verified (a note in
@@ -1192,6 +1194,9 @@ cmd_land() {
     fi
   fi
   # a re-land lands each of its branches itself; a hand land in the middle would wedge its plan
+  if [ -d "$(_rl_dir)" ] && [ "${RAPID_RELAND_STEP:-}" != 1 ]; then
+    rapid_die "a rapid sync --dev re-land is in progress and lands this branch itself; finish the stopped step, then 'rapid sync --dev --continue' (or 'rapid sync --dev --abort' to keep the rest as branches not landed yet)"
+  fi
   local extra=""
   if [ -n "$body_file" ]; then
     [ -f "$body_file" ] || rapid_die "body file $body_file not found"
@@ -1553,6 +1558,7 @@ _anchor_refspecs() {
 # branch then goes to origin with a lease on the copy origin had (or is created).
 cmd_sync() {
   local push=false
+  case "${1:-}" in --dev) shift; _sync_dev "$@"; return ;; --push) push=true ;; "") ;; *) RAPID_RC=2 rapid_die "sync: unknown argument $1" ;; esac
   local root branch ks kind slug pf old
   root=$(rapid_root); cd "$root"
   branch=$(rapid_branch)
@@ -1604,6 +1610,242 @@ _gates_notes_in() {
   fi
 }
 
+# _origin_tags_in: fetch origin dev and every origin tag (tags into a private
+# namespace, so an origin tag never overwrites a local one of the same name),
+# then create locally each origin tag this clone lacks.
+_origin_tags_in() {
+  local r n
+  git fetch -q --no-tags origin '+refs/heads/dev:refs/remotes/origin/dev' '+refs/tags/*:refs/rapid/origin-tags/*' 2>/dev/null \
+    || rapid_die "origin is unreachable; sync --dev needs it"
+  for r in $(git for-each-ref --format='%(refname)' refs/rapid/origin-tags); do
+    n="${r#refs/rapid/origin-tags/}"
+    git rev-parse -q --verify "refs/tags/$n" >/dev/null || git update-ref "refs/tags/$n" "$(git rev-parse "$r")"
+  done
+}
+
+# rapid sync --dev: reconcile local dev with origin dev after working offline.
+#   behind origin: fast-forward (and take origin's tags);
+#   ahead of origin: publish the local lands in one atomic push;
+#   diverged: re-land each local-only merge, in order, on top of origin dev.
+#   The old dev is kept whole in the snapshot branch safety/dev-<timestamp>
+#   (nothing is lost) and each re-landed merge takes the next version on the
+#   new line. The re-land is resumable: its plan lives in .git/rapid-reland, a
+#   conflict stops it with the plan kept, and --continue or --abort finish it.
+#   A Fixes: trailer that names a re-landed commit is rewritten to its new sha.
+_rl_dir() { git rev-parse --git-path rapid-reland; }
+
+_sync_dev() {
+  local mode="" root o d
+  case "${1:-}" in --continue) mode=continue ;; --abort) mode=abort ;; "") ;; *) RAPID_RC=2 rapid_die "sync --dev: unknown argument $1" ;; esac
+  root=$(rapid_root); cd "$root"
+  if [ -d "$(_rl_dir)" ]; then
+    case "$mode" in
+      continue) _rl_continue; return ;;
+      abort) _rl_abort; return ;;
+      *) rapid_die "a re-land is in progress ($(wc -l < "$(_rl_dir)/merges" | tr -d ' ') land(s) left); finish the stopped step, then 'rapid sync --dev --continue', or 'rapid sync --dev --abort'" ;;
+    esac
+  fi
+  [ -z "$mode" ] || rapid_die "no re-land is in progress"
+  rapid_has_remote || rapid_die "no origin remote; there is nothing to reconcile with"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit or stash them first"
+  git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
+  git fetch -q --no-tags origin '+refs/heads/dev:refs/remotes/origin/dev' 2>/dev/null || rapid_die "origin is unreachable; sync --dev needs it"
+  o=$(git rev-parse refs/remotes/origin/dev); d=$(git rev-parse dev)
+  local pend; pend=$(rapid_reland_pending dev)
+  [ -z "$pend" ] || rapid_die "replaced merges are not on dev yet:
+$(sed 's/^/  /' <<<"$pend")
+  re-land them (git switch -c pool/v<series>/<number>.<kind>.<slug> <merge>^2, rapid sync, rapid land) or leave them as branches not landed yet (git branch pool/v<series>/<number>.<kind>.<slug> <merge>^2)"
+  if [ "$o" = "$d" ]; then _origin_tags_in; rapid_info "dev matches origin ($(git rev-parse --short "$d"))"; return 0; fi
+  if git merge-base --is-ancestor "$d" "$o"; then
+    _origin_tags_in; _verify_incoming "$d" "$o"; _move_branch dev "$o" "$d"
+    rapid_info "dev fast-forwarded to origin ($(git rev-parse --short "$o"))"; return 0
+  fi
+  if git merge-base --is-ancestor "$o" "$d"; then
+    local m v tags=""
+    for m in $(git rev-list --first-parent "$o..$d"); do
+      v=$(rapid_version_of "$m"); [ -n "$v" ] || rapid_die "$(git rev-parse --short "$m") on dev carries no version tag; run 'rapid doctor --history'"
+      tags="$tags refs/tags/$v"
+    done
+    # shellcheck disable=SC2086
+    _gates_notes_in
+    local gn=""; git rev-parse -q --verify refs/notes/gates >/dev/null && gn=refs/notes/gates:refs/notes/gates
+    # shellcheck disable=SC2086
+    git push -q --atomic origin "$d:refs/heads/dev" $tags $gn || rapid_die "origin refused the push; nothing was published"
+    rapid_info "published $(git rev-list --first-parent --count "$o..$d") local land(s) to origin:$(sed 's#refs/tags/##g' <<<"$tags")"
+    _anchors_publish
+    return 0
+  fi
+  _origin_tags_in; _verify_incoming "$(git merge-base "$o" "$d")" "$o"
+  _rl_start "$o" "$d"
+}
+
+# _anchors_publish: push every safety anchor this clone holds and origin
+# lacks (branches landed or closed offline); an anchor is only ever created there.
+_anchors_publish() {
+  local have r want=""
+  have=$(git ls-remote origin 'refs/heads/safety/*' 'refs/heads/vault/*' 2>/dev/null | cut -f2) || return 0
+  for r in $(git for-each-ref --format='%(refname)' refs/heads/safety refs/heads/vault); do
+    grep -Fx -- "$r" <<<"$have" >/dev/null || want="$want $r:$r"
+  done
+  [ -z "$want" ] && return 0
+  # shellcheck disable=SC2086
+  git push -q origin $want </dev/null && rapid_info "published $(wc -w <<<"$want" | tr -d ' ') safety anchor(s)" \
+    || rapid_warn "could not publish every safety anchor; they stay here and the next rapid sync --dev retries"
+}
+
+# _rl_start O D: plan and run the re-land of D's local-only merges onto O.
+_rl_start() {
+  local o="$1" d="$2" base list m v pf dir sb
+  base=$(git merge-base "$o" "$d")
+  list=$(git rev-list --first-parent --reverse "$base..$d")
+  for m in $list; do
+    [ "$(git rev-list --parents -n1 "$m" | wc -w | tr -d ' ')" = 3 ] && [ -n "$(rapid_version_of "$m")" ] \
+      || rapid_die "local dev holds $(git rev-parse --short "$m"), which rapid land did not make; reconcile it by hand"
+  done
+  pf="refs/rapid/preflight/dev/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short "$d")"
+  git update-ref "$pf" "$d"
+  dir=$(_rl_dir); mkdir -p "$dir"
+  # the old dev stays whole in a snapshot branch of the safety namespace
+  sb="refs/heads/safety/dev-$(date -u +%Y%m%d-%H%M%S)"
+  git update-ref "$sb" "$d" "$RAPID_ZERO"
+  printf '%s\n' "$pf" > "$dir/preflight"; : > "$dir/map"
+  printf '%s\n' $list > "$dir/merges"
+  for m in $list; do
+    v=$(rapid_version_of "$m")
+    git tag -d "$v" >/dev/null
+  done
+  _origin_tags_in
+  git switch -q --detach "$o"
+  git update-ref refs/heads/dev "$o" "$d"
+  _rl_run
+}
+
+# _rl_pick C: cherry-pick one branch commit, record old->new, rewrite Fixes:.
+_rl_pick() {
+  local c="$1" dir fx full new msg
+  dir=$(_rl_dir)
+  git rev-parse HEAD > "$dir/pre"
+  if ! git -c core.hooksPath=/dev/null cherry-pick "$c" >/dev/null 2>&1; then
+    printf '%s\n' "$c" > "$dir/stopped"
+    return 1
+  fi
+  _rl_after_pick "$c"
+}
+
+# _rl_after_pick C: HEAD is C re-applied (or C was skipped): map and fix up.
+_rl_after_pick() {
+  local c="$1" dir fx full new msg
+  dir=$(_rl_dir); rm -f "$dir/stopped"
+  [ "$(git rev-parse HEAD)" != "$(cat "$dir/pre")" ] || return 0   # skipped: nothing to map
+  fx=$(rapid_trailer HEAD Fixes)
+  if [ -n "$fx" ]; then
+    full=$(git rev-parse -q --verify "$fx^{commit}" 2>/dev/null || true)
+    new=$(awk -v o="$full" '$1 == o { print $2 }' "$dir/map" | sed -n 1p)
+    if [ -n "$new" ]; then
+      msg=$(mktemp "${TMPDIR:-/tmp}/rapid-msg.XXXXXX")
+      git log -1 --format=%B HEAD | sed -E "s/^Fixes: .*/Fixes: $new/" > "$msg"
+      git -c core.hooksPath=/dev/null commit -q --amend -F "$msg"; rm -f "$msg"
+    fi
+  fi
+  printf '%s %s\n' "$(git rev-parse "$c")" "$(git rev-parse HEAD)" >> "$dir/map"
+}
+
+# _rl_run: work through the plan; a conflict stops it with the plan kept.
+_rl_run() {
+  local lb ks dir m subj kind slug c body here out
+  dir=$(_rl_dir)
+  while [ -s "$dir/merges" ]; do
+    m=$(sed -n 1p "$dir/merges"); subj=$(git log -1 --format=%s "$m")
+    # the re-landed branch keeps the name its merge subject records
+    lb=$(rapid_subject_branch "$subj"); ks=$(rapid_subject_ks "$subj"); kind="${ks%% *}"; slug="${ks##* }"
+    if rapid_slug_landed "$slug" dev; then
+      # already on dev (landed by hand before land refused it): nothing left to re-land
+      git switch -q dev 2>/dev/null || true
+      git branch -q -D "$lb" 2>/dev/null || true
+      rm -f "$dir/commits"; sed -i.bak 1d "$dir/merges"; rm -f "$dir/merges.bak"
+      rapid_info "$kind/$slug is already on dev; dropped from the re-land plan"
+      continue
+    fi
+    if [ ! -f "$dir/commits" ]; then
+      git rev-parse -q --verify "refs/heads/$lb" >/dev/null && rapid_die "$lb already exists; move it aside, then 'rapid sync --dev --continue'"
+      git switch -q -c "$lb" dev
+      git rev-list --reverse "$m^1..$m^2" > "$dir/commits"
+    fi
+    while [ -s "$dir/commits" ]; do
+      c=$(sed -n 1p "$dir/commits")
+      if ! _rl_pick "$c"; then
+        rapid_die "re-landing $kind/$slug stopped on a conflict in: $(git diff --name-only --diff-filter=U | tr '\n' ' ')
+  resolve, git add, git cherry-pick --continue (or --skip), then 'rapid sync --dev --continue'.
+  $(( $(wc -l < "$dir/merges") )) land(s) remain in the plan; 'rapid sync --dev --abort' keeps them as branches not landed yet.
+  Nothing is lost: the old dev is kept at $(cat "$dir/preflight") and in its snapshot branch safety/dev-<timestamp>."
+      fi
+      sed -i.bak 1d "$dir/commits"; rm -f "$dir/commits.bak"
+    done
+    here=$(rapid_tmpdir relanding); body="$here/body"
+    git log -1 --format=%B "$m" | sed 1d | grep -vE '^(Branch-Base|Requirement|Gates|Tested-Tree|Branch-Number|Ticket|Test|Docs|Untested): ' | sed '/./,$!d' > "$body"
+    if ! out=$(RAPID_RELAND_STEP=1 "$RAPID_SELF/rapid" land --batch -F "$body" 2>&1); then
+      rm -rf "$here"; sed 's/^/  | /' <<<"$out" >&2
+      grep -q 'already landed' <<<"$out" && rapid_die "$kind/$slug was landed on origin by another clone; on $lb run 'rapid branch --rename <new-name>', then 'rapid sync --dev --continue'"
+      rapid_die "re-landing $kind/$slug failed (above); fix it on $lb, then 'rapid sync --dev --continue'"
+    fi
+    rm -rf "$here"
+    rm -f "$dir/commits"; sed -i.bak 1d "$dir/merges"; rm -f "$dir/merges.bak"
+    rapid_info "re-landed $kind/$slug as $(rapid_version_of dev)"
+  done
+  _rl_finish
+}
+
+_rl_finish() {
+  local dir pf
+  dir=$(_rl_dir); pf=$(cat "$dir/preflight")
+  # each re-land step landed into the batch: one close tests the final tree and publishes it
+  if [ -s "$(git rev-parse --git-common-dir)/rapid/batch" ]; then
+    RAPID_RELAND_STEP=1 "$RAPID_SELF/rapid" land || rapid_die "the re-landed merges did not pass the close of their batch; fix it (or rapid land --prune), then rapid sync --dev --continue"
+  fi
+  _anchors_publish
+  rm -rf "$dir"
+  git switch -q dev 2>/dev/null || true
+  rapid_info "re-land done; dev matches origin ($(git rev-parse --short dev)); old dev kept at $pf"
+}
+
+_rl_continue() {
+  local dir c
+  dir=$(_rl_dir)
+  git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null && rapid_die "a cherry-pick is still in progress; resolve, git add, git cherry-pick --continue (or --skip), then rerun"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; finish the cherry-pick first"
+  if [ -f "$dir/stopped" ]; then
+    c=$(cat "$dir/stopped"); _rl_after_pick "$c"
+    sed -i.bak 1d "$dir/commits"; rm -f "$dir/commits.bak"
+  fi
+  _rl_run
+}
+
+# _rl_abort: stop re-landing. The current partial branch is dropped; every
+# merge not yet re-landed is kept as a branch not landed yet, its branch at the
+# merge's branch tip (with a note), to sync and land again. Nothing is deleted.
+_rl_abort() {
+  local lb ks dir m subj kind slug
+  dir=$(_rl_dir)
+  git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null && git cherry-pick --abort >/dev/null 2>&1 || true
+  git switch -q dev 2>/dev/null || git switch -q --detach dev
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    subj=$(git log -1 --format=%s "$m")
+    # the re-landed branch keeps the name its merge subject records
+    lb=$(rapid_subject_branch "$subj"); ks=$(rapid_subject_ks "$subj"); kind="${ks%% *}"; slug="${ks##* }"
+    git branch -q -D "$lb" 2>/dev/null || true
+    # a name already on dev is never kept: it would be landed and not landed at once (I7)
+    if rapid_slug_landed "$slug" dev; then rapid_info "$kind/$slug is already on dev; not kept"; continue; fi
+    git branch "$lb" "$m^2"
+    # a number another clone published while this one was offline: the kept branch takes the next free one
+    lb=$(_branch_renumber_taken "$lb" "$kind" "$slug")
+    git notes --ref=rapid append -m "kept by rapid sync --dev --abort $(date -u +%Y-%m-%dT%H:%MZ); land it with git switch $lb, rapid sync, rapid land" "$lb"
+    rapid_info "kept $kind/$slug as the branch not landed yet $lb"
+  done < "$dir/merges"
+  rm -rf "$dir"
+  rapid_info "re-land aborted; dev is at origin's dev ($(git rev-parse --short dev)); branches not landed yet are listed above"
+}
+
 # ---------------------------------------------------------------- status
 cmd_status() {
   local root b v rel l ahead behind json=false sep="" oa="" ob=""
@@ -1619,6 +1861,7 @@ cmd_status() {
     for l in $(git for-each-ref --format='%(refname:short)' $RAPID_POOL_NS); do
       printf '%s{"name": "%s", "ahead": %s, "behind": %s}' "$sep" "$l" "$(git rev-list --count "dev..$l")" "$(git rev-list --count "$l..dev")"; sep=", "
     done
+    printf '], "not_landed": %s, "landed_live": %s, "reland_pending": %s}\n' "$(_not_landed | sed '/^$/d' | wc -l | tr -d ' ')" "$(_landed_live | sed '/^$/d' | wc -l | tr -d ' ')" "$([ -d "$(_rl_dir)" ] && echo true || echo false)"
     return 0
   fi
   b=$(rapid_branch)
@@ -1711,6 +1954,7 @@ cmd_doctor() {
     _agent_guard_installed || rapid_warn "doctor: this is an agent session ($sm is set) and the rapid agent guard is not installed; run rapid setup --agent"
   fi
   for k in main dev; do git rev-parse -q --verify "refs/heads/$k" >/dev/null || { rapid_info "doctor: no $k branch"; bad=1; }; done
+  [ ! -d "$(_rl_dir)" ] || { rapid_info "doctor: a rapid sync --dev re-land is in progress; finish it with --continue or --abort"; bad=1; }
   # origin's dev as last fetched: every commit this clone would take must be one rapid land made
   if rapid_has_remote && git rev-parse -q --verify refs/remotes/origin/dev >/dev/null && git rev-parse -q --verify refs/heads/dev >/dev/null; then
     out=$(_incoming_problems dev refs/remotes/origin/dev)

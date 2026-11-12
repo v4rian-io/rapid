@@ -478,3 +478,83 @@ rapid_reland_pending() {
     done
   done
 }
+
+# rapid_verify_merge M [GATES] [TIP]: re-run the gates (default "fast full") the conf at M's first parent names on
+# M's own tree and compare with M's Gates: test record. Prints "P1 <m> <why>" per
+# gate that fails (a test record that claims a pass it cannot show is a lie). TIP (default
+# dev) is the line M sits on: a deferred test record is read with the last merge of its batch.
+rapid_verify_merge() {
+  local m="$1" gates="${2:-fast full}" tip="${3:-dev}" p1 wt g r test_record claimed out="" last id c bf
+  p1=$(git rev-parse "$m^1"); test_record=$(rapid_trailer "$m" Gates)
+  # a batch merge is verified by what its close ran: gates_each on its own tree, and on the
+  # last merge of the batch the full gate as well. The conf stays the first parent's, and the
+  # test record holds only when that last merge carries the close record in the gate log
+  # (a batch still open in this clone has no close yet: its merges run gates_each alone)
+  if [[ "$test_record" == "deferred to the close of batch "* ]]; then
+    gates=each; last="$m"; id="${test_record##* }"
+    for c in $(git rev-list --first-parent --reverse "$m..$tip" 2>/dev/null || true); do
+      [ "$(rapid_trailer "$c" Gates)" = "$test_record" ] || break
+      last="$c"
+    done
+    bf="$(git rev-parse --git-common-dir)/rapid/batch"
+    if [ ! -s "$bf" ] || [ "$(git rev-parse -q --verify "$id^{commit}" 2>/dev/null || true)" != "$(cat "$bf")" ]; then
+      if ! grep "^close of batch [0-9a-f]*: gates on the final tree $(git rev-parse "$last^{tree}")\$" <<<"$(git notes --ref=gates show "$last" 2>/dev/null || true)" >/dev/null; then
+        echo "P1 $m defers its gates to the close of batch $id, and the last merge of that batch ($(git rev-parse --short "$last")) carries no close record in the gate log: no gate is shown to have run"
+        return 0
+      fi
+      [ "$m" != "$last" ] || gates="each full"
+    fi
+  fi
+  wt=$(mktemp -d "${TMPDIR:-/tmp}/rapid-verify.XXXXXX")
+  git worktree add -q --detach "$wt" "$m" >/dev/null 2>&1 || { echo "P1 $m cannot check out its tree"; return 0; }
+  for g in $gates; do
+    claimed=$(sed -nE "s/(^|.*[[:space:]])$g=([a-z]+).*/\2/p" <<<"$test_record")
+    r=$(RAPID_CONF_REV="$p1" rapid_gate "$g" "$wt" 2>/dev/null) || true
+    if [ "$r" = fail ]; then
+      out="$out
+P1 $m gate $g fails on the merge tree (test record says ${claimed:-nothing})"
+    fi
+  done
+  git worktree remove --force "$wt" >/dev/null 2>&1 || true
+  [ -z "$out" ] || printf '%s\n' "${out#?}"
+  return 0
+}
+
+# rapid_ungated_range SINCE DEV: the version (or sha) of each first-parent
+# merge of DEV after SINCE whose Gates: test record names no gate that ran.
+rapid_ungated_range() {
+  local since="$1" dev="${2:-dev}" root m range g v ng out=""
+  ng=" $(rapid_exceptions "$dev" | sed -nE 's/^no-gate: [0-9]+ merge\(s\): //p') "
+  root=$(rapid_dev_root "$dev")
+  case "$since" in ""|0000000000000000000000000000000000000000) range="$root..$dev" ;; *) range="$since..$dev" ;; esac
+  for m in $(git rev-list --first-parent --reverse $range); do
+    [ "$m" = "$root" ] && continue
+    g=$(rapid_trailer "$m" Gates)
+    [[ "$g" == *=pass* ]] && continue
+    # a batch merge is gated by its close, unless that close had no gate configured
+    if [[ "$g" == "deferred to the close of batch "* ]]; then
+      v=$(rapid_version_of "$m"); [ -n "$v" ] || v=$(git rev-parse --short "$m")
+      case "$ng" in *" $v "*) out="$out $v" ;; esac
+      continue
+    fi
+    out="$out $(rapid_version_of "$m")"; [ -n "$(rapid_version_of "$m")" ] || out="$out$(git rev-parse --short "$m")"
+  done
+  printf '%s' "${out# }"
+}
+
+# rapid_verify_range SINCE DEV: rapid_verify_merge on each first-parent merge of DEV
+# after SINCE (SINCE empty or all zeros: every merge after the root), and
+# rapid_verify_release on each of them that a release/<v> tag names.
+rapid_verify_range() {
+  local since="$1" dev="${2:-dev}" root m range
+  root=$(rapid_dev_root "$dev")
+  case "$since" in ""|0000000000000000000000000000000000000000) range="$root..$dev" ;; *) range="$since..$dev" ;; esac
+  local pn=0 pt; pt=$(git rev-list --first-parent --count $range)
+  for m in $(git rev-list --first-parent --reverse $range); do
+    [ "$m" = "$root" ] && continue
+    pn=$((pn + 1))
+    [ -z "${rapid_live:-}" ] || printf 'doctor: verify: [%s/%s] %s\n' "$pn" "$pt" "$(_hv=$(rapid_version_of "$m"); [ -n "$_hv" ] || _hv=$(git rev-parse --short "$m"); printf %s "$_hv")" >&2
+    rapid_verify_merge "$m" "fast full" "$dev"
+  done
+}
+

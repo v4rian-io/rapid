@@ -114,6 +114,16 @@ rapid_path_in() {
   return 1
 }
 
+# rapid_signed_problem COMMIT: empty when signed=required is off or COMMIT
+# carries a signature git verifies (G, or U: good, trust unknown), else why.
+rapid_signed_problem() {
+  [ "$(rapid_conf signed optional)" = required ] || return 0
+  case "$(git log -1 --format=%G? "$1" 2>/dev/null)" in
+    G|U) return 0 ;;
+    *) echo "$(git rev-parse --short "$1") is not signed with a key git verifies (signed=required): sign it (git commit -S, commit.gpgsign=true) and make the key verifiable (gpg, or gpg.ssh.allowedSignersFile)" ;;
+  esac
+}
+
 # rapid_verified_signer tag|commit OBJECT REV: who signed OBJECT, as git verifies it: the
 # principal (ssh) or the GOODSIG email (gpg); empty without a good signature. The keys come
 # from .rapid/signers committed at REV when it exists, else from git's own config.

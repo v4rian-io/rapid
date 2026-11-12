@@ -147,3 +147,71 @@ rapid_log_tail() {
       print
     }'
 }
+
+# rapid_gate NAME DIR: run gates_NAME in DIR; prints pass|fail|none, rc 0 unless fail.
+# With RAPID_GATE_REC set (a file path), the run, green or red, is recorded
+# there: its command, exit code, duration and log tail (rapid land's gate log).
+rapid_gate() {
+  local name="$1" dir="$2" live="${3:-}" cmd rc=0 log t0
+  cmd=$(rapid_conf "gates_$name" "")
+  if [ -z "$cmd" ] || [ "$cmd" = none ]; then echo none; return 0; fi
+  log=$(mktemp "${TMPDIR:-/tmp}/rapid-gate-$name.XXXXXX"); t0=$(date +%s)
+  # The gate is the project's own command: it runs without rapid's internal
+  # state (RAPID_CONF_REV names a revision of this repository, which a test
+  # suite driving other repositories must not inherit).
+  local tof; tof=$(rapid_conf test_on_fail "" 2>/dev/null || true)
+  if [ "$live" = live ]; then
+    # a long gate (the release gate) is followed as it runs: its output goes to stderr live, to the log as well
+    { ( cd "$dir" && unset RAPID_CONF_REV RAPID_OFFLINE RAPID_RELAND_STEP RAPID_GATE_REC RAPID_DEVEXEC GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && export RAPID_TEST_ON_FAIL="${RAPID_TEST_ON_FAIL:-$tof}" && sh -c "$cmd" ) 2>&1 || echo "$?" > "$log.rc"; } | tee "$log" >&2 || true
+    if [ -f "$log.rc" ]; then rc=$(cat "$log.rc"); rm -f "$log.rc"; fi
+  else
+    ( cd "$dir" && unset RAPID_CONF_REV RAPID_OFFLINE RAPID_RELAND_STEP RAPID_GATE_REC RAPID_DEVEXEC GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && export RAPID_TEST_ON_FAIL="${RAPID_TEST_ON_FAIL:-$tof}" && sh -c "$cmd" ) >"$log" 2>&1 || rc=$?
+  fi
+  if [ -n "${RAPID_GATE_REC:-}" ]; then
+    {
+      printf 'gate=%s\ncommand=%s\nexit=%s\nduration=%ss\nat=%s\n' \
+        "$name" "$cmd" "$rc" "$(( $(date +%s) - t0 ))" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf -- '--- log tail\n'
+      rapid_log_tail "$log"
+    } > "$RAPID_GATE_REC"
+  fi
+  if [ "$rc" = 0 ]; then rm -f "$log"; echo pass; return 0; fi
+  # the end of the log: a test runner prints its failures and counts last
+  [ "$live" = live ] || tail -n 25 "$log" | sed 's/^/    | /' >&2
+  rm -f "$log"
+  echo fail; return 1
+}
+
+# rapid_check_each BASE TIP: the fast gate on every commit of BASE..TIP, in order.
+# A failing commit passes only with a Red: trailer and a later green commit:
+# the commit right after it must pass and carry no Red: (no chain of reds),
+# and a Red: commit whose gate passes is a stale marker, refused. Shared by
+# rapid check --each and rapid land (a branch push runs no gate: transport).
+rapid_check_each() {
+  local base="$1" tip="$2" wt c r subj red last fails=0 prev_red=0
+  last=$(git rev-parse "$tip")
+  if [ -z "$(rapid_conf gates_fast "")" ]; then rapid_info "check --each: no fast gate configured"; return 0; fi
+  wt=$(rapid_private_wt each "$base") || { rapid_info "  FAIL  cannot make a private work tree under ${TMPDIR:-/tmp}"; return 1; }
+  for c in $(git rev-list --reverse "$base..$tip"); do
+    git -C "$wt" checkout -q --detach "$c"
+    subj=$(git log -1 --format=%s "$c"); red=$(rapid_trailer "$c" Red)
+    if r=$(rapid_gate fast "$wt" 2>/dev/null); then
+      if [ -n "$red" ]; then
+        rapid_info "  FAIL  $(git rev-parse --short "$c") $subj: stale Red: marker, the fast gate passes (Red: $red)"; fails=1
+      else
+        rapid_info "  pass  $(git rev-parse --short "$c") $subj"
+      fi
+      prev_red=0
+    elif [ -n "$red" ] && [ "$prev_red" = 1 ]; then
+      rapid_info "  FAIL  $(git rev-parse --short "$c") $subj: a Red: commit follows a Red: commit; the commit after a red one turns it green"; fails=1
+    elif [ -n "$red" ] && [ "$c" != "$last" ]; then
+      rapid_info "  red   $(git rev-parse --short "$c") $subj (marked: Red: $red)"; prev_red=1
+    elif [ -n "$red" ]; then
+      rapid_info "  FAIL  $(git rev-parse --short "$c") $subj: a Red: commit cannot be the branch tip"; fails=1
+    else
+      rapid_info "  FAIL  $(git rev-parse --short "$c") $subj: fast gate fails and no Red: trailer marks it"; fails=1
+    fi
+  done
+  git worktree remove --force "$wt" >/dev/null 2>&1 || true
+  return "$fails"
+}

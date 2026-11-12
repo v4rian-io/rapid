@@ -12,6 +12,8 @@
 #                                      requirement_test=required
 #                                      (--test: the test file or scenario name that verifies it, as its Test: line);
 #                                      it also writes the safety anchor safety/v<series>/n<N>.<kind>.<name> (kept forever)
+#   rapid check [--gate NAME] [--each]   run a gate on the work tree, or the commit audit and the fast gate on
+#                                      every branch commit
 #   rapid land [-F BODY] [--dry-run] [--failed-gates-only] [--verbose]
 #                                      merge the current branch into dev once, tagged, then close the open
 #                                      batch: this branch and every one landed with --batch are tested once on
@@ -389,6 +391,27 @@ _landed_live() {
     git cat-file -e "$sha^{commit}" 2>/dev/null && git merge-base --is-ancestor "$sha" "$d" 2>/dev/null && printf '%s\n' "${ref#refs/heads/}"
   done
   return 0
+}
+
+cmd_check() {
+  local gate=fast each=false root res
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --gate) gate="${2:-}"; shift 2 ;;
+      --each) each=true; shift ;;
+      *) RAPID_RC=2 rapid_die "check: unknown argument $1" ;;
+    esac
+  done
+  root=$(rapid_root); cd "$root"
+  if $each; then
+    git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch"
+    rapid_info "-> commit audit"
+    RAPID_CONF_REV=dev rapid_check_each "$(git merge-base dev HEAD)" HEAD || rapid_die "check --each failed"
+    rapid_info "ok: every branch commit passes the fast gate or is a marked red commit"
+    return 0
+  fi
+  res=$(rapid_gate "$gate" "$root") || rapid_die "gate $gate: fail"
+  rapid_info "gate $gate: $res"
 }
 
 
@@ -1115,6 +1138,7 @@ $(sed 's/^/  - /' <<<"$out")"
     $dry || rapid_info "-> batch $(git rev-parse --short "$(cat "$bf")"): gates deferred to the close of the batch; nothing is pushed until then"
   else
   rapid_info "-> check --each (fast gate on every branch commit)"
+  rapid_check_each dev HEAD || rapid_die "a branch commit fails the fast gate; fix it or mark a test-first commit with a Red: trailer"
   fi
   read -r v rel <<<"$(rapid_version_last dev)"
   next=$(rapid_version_next "$v" "$rel" "$(rapid_year)")
@@ -1136,6 +1160,8 @@ $(sed 's/^/  - /' <<<"$out")"
   else
   # both gates run on the merge tree, each recorded for the merge's gate log note
   gr=$(rapid_tmpdir gaterec)
+  g_fast=$(RAPID_GATE_REC="$gr/fast" rapid_gate fast "$wt") || { git -C "$wt" merge --abort >/dev/null 2>&1 || true; git worktree remove --force "$wt" >/dev/null 2>&1 || true; rapid_die "fast gate fails on the merge tree; dev unchanged"; }
+  g_full=$(RAPID_GATE_REC="$gr/full" rapid_gate full "$wt") || { git -C "$wt" merge --abort >/dev/null 2>&1 || true; git worktree remove --force "$wt" >/dev/null 2>&1 || true; rapid_die "full gate fails on the merge tree; dev unchanged"; }
   [ "$(git -C "$wt" write-tree)" = "$tree" ] || { git -C "$wt" merge --abort >/dev/null 2>&1 || true; git worktree remove --force "$wt" >/dev/null 2>&1 || true; rapid_die "a gate changed the staged merge tree; dev unchanged"; }
   gates="fast=$g_fast full=$g_full"; tkey=Tested-Tree
   fi
@@ -1451,6 +1477,7 @@ esac
 case "${1:-}" in
   setup) shift; cmd_setup "$@" ;;
   branch) shift; cmd_branch "$@" ;;
+  check) shift; cmd_check "$@" ;;
   land) shift; cmd_land "$@" ;;
   status) shift; cmd_status "$@" ;;
   -h|--help) usage 0 ;;

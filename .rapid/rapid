@@ -35,6 +35,8 @@
 #   rapid land --prune                   put dev back where the batch began and drop the batch, the branches unchanged
 #   rapid land --pr [-F BODY]            open or update the branch's PR (body = the merge body); once it has
 #                                      land_approvals approvals, land it the same way (exit 3 while waiting)
+#   rapid sync [--push]                  rebase the current branch onto dev behind a preflight ref (local only;
+#                                      --push then lease-pushes the branch to origin)
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
 #                                      I1 to I9, in full only after the last merge this clone verified (a note in
@@ -1499,6 +1501,48 @@ _anchor_refspecs() {
   done
 }
 
+# rapid sync: bring the current branch onto dev's tip. The branch tip is kept
+# first under refs/rapid/preflight/<name>/<stamp>, the branch is rebased onto dev
+# (dev first fast-forwarded from origin). sync never pushes: with --push the
+# branch then goes to origin with a lease on the copy origin had (or is created).
+cmd_sync() {
+  local push=false
+  local root branch ks kind slug pf old
+  root=$(rapid_root); cd "$root"
+  branch=$(rapid_branch)
+  ks=$(rapid_branch_parse "$branch") || rapid_die "sync runs on a pool/v<series>/<number>.<kind>.<name> branch (on '${branch:-detached}'); use 'rapid sync --dev' for dev"
+  set -- $ks; kind="$1"; slug="$2"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit them to the branch first"
+  rapid_slug_landed "$slug" && rapid_die "name '$slug' already landed on dev (I7); $(_rename_hint "$branch" "$kind" "$slug")"
+  branch=$(_branch_renumber_taken "$branch" "$kind" "$slug")
+  pf="refs/rapid/preflight/$slug/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+  git update-ref "$pf" HEAD
+  if [ "$(git merge-base dev HEAD)" = "$(git rev-parse dev)" ]; then
+    rapid_info "branch already contains dev ($(git rev-parse --short dev)); nothing to rebase"
+  elif ! git -c core.hooksPath=/dev/null rebase -q dev >/dev/null 2>&1; then
+    rapid_die "sync stopped on a conflict in: $(git diff --name-only --diff-filter=U | tr '\n' ' ')
+  resolve the files, git add them, git rebase --continue, then rapid sync again;
+  or git rebase --abort to stop. The branch as it was is kept at $pf
+  (git reset --hard $pf brings it back)."
+  else
+    rapid_info "branch rebased onto dev ($(git rev-parse --short dev)); the previous tip is kept at $pf"
+  fi
+  # pushing is transport and never implied: only --push sends the branch
+  if $push; then
+    rapid_has_remote || rapid_die "sync --push: no origin to push to"
+    old=$(git ls-remote origin "refs/heads/$branch" | cut -f1) || rapid_die "sync --push: origin is unreachable; the branch stays local"
+    if [ "$old" != "$(git rev-parse HEAD)" ]; then
+      # the branch goes with its safety anchor and its number in one push, so the pre-push
+      # hook has no anchor left to push while this push is open
+      # shellcheck disable=SC2046
+      git push -q --atomic --force-with-lease="refs/heads/$branch:$old" origin "HEAD:refs/heads/$branch" $(_anchor_refspecs "$branch") \
+        || rapid_die "origin refused $branch (its reason is above); if origin's copy moved, fetch and compare before pushing"
+      if [ -n "$old" ]; then old=$(git rev-parse --short "$old" 2>/dev/null || printf '%s' "${old:0:7}"); else old="<none>"; fi
+      rapid_info "pushed $branch (lease on $old)"
+    fi
+  fi
+}
+
 # _gates_notes_in: take origin's refs/notes/gates into the local notes before
 # a land adds to them, so the atomic push only ever fast-forwards the ref (an
 # offline land's notes are merged in, never dropped). Without origin, a no-op.
@@ -1682,6 +1726,7 @@ case "${1:-}" in
   branch) shift; cmd_branch "$@" ;;
   check) shift; cmd_check "$@" ;;
   land) shift; cmd_land "$@" ;;
+  sync) shift; cmd_sync "$@" ;;
   status) shift; cmd_status "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   -h|--help) usage 0 ;;

@@ -12,6 +12,7 @@
 #                                      requirement_test=required
 #                                      (--test: the test file or scenario name that verifies it, as its Test: line);
 #                                      it also writes the safety anchor safety/v<series>/n<N>.<kind>.<name> (kept forever)
+#   rapid branch --rename NEW_NAME         give the current branch a new name (requirements file follows)
 #   rapid check [--gate NAME] [--each]   run a gate on the work tree, or the commit audit and the fast gate on
 #                                      every branch commit
 #   rapid check --reqs [--save [FILE]]   print the requirements register, built from .rapid/requirements/ on the spot
@@ -377,6 +378,7 @@ _sync_dev_from_origin() {
 
 cmd_branch() {
   case "${1:-}" in
+    --rename) shift; _branch_rename "$@"; return ;;
     ""|-h|--help) usage 2 ;;
   esac
   local kind="$1" slug="${2:-}" req="" ticket="" req_test="" root
@@ -425,6 +427,52 @@ cmd_branch() {
   fi
   [ -z "$ticket" ] || rapid_tracker_call link "$ticket" --branch "$pn" >/dev/null || true
   rapid_info "$pn started at dev ($(git rev-parse --short dev)), anchored at safety/${pn#pool/}; nothing is pushed; $rnote"
+}
+
+# _branch_rename NEW: give the current branch a new name. Every branch commit is
+# rewritten so the requirement file <old>.md was always <new>.md (the
+# rename never deletes a file another branch landed under the old name), the
+# branch becomes pool/v<series>/<number>.<kind>.<new>, and the old tip is kept as a preflight ref.
+_branch_rename() {
+  local new="${1:-}" branch ks kind slug base parent c tree idx msg pf rqo
+  rapid_slug_ok "$new" || RAPID_RC=2 rapid_die "name '$new' must be a-z, 0-9 and -, 2 to 48 chars"
+  branch=$(rapid_branch)
+  ks=$(rapid_branch_parse "$branch") || RAPID_RC=2 rapid_die "branch --rename runs on a pool/v<series>/<number>.<kind>.<name> branch"
+  rapid_branch_open "$branch" || RAPID_RC=2 rapid_die "'$branch' is not an open branch"
+  set -- $ks; kind="$1"; slug="$2"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit them first"
+  _slug_taken "$new" && rapid_die "name '$new' is already used by a branch, landed or not (I7)"
+  base=$(git merge-base dev HEAD)
+  ! rqo=$(rapid_req_path "$base" "$slug") || rapid_die "$rqo predates this branch; start a new branch instead"
+  pf="refs/rapid/preflight/$slug/$(date -u +%Y%m%dT%H%M%SZ)-$(git rev-parse --short HEAD)"
+  git update-ref "$pf" HEAD
+  idx=$(mktemp "${TMPDIR:-/tmp}/rapid-index.XXXXXX"); msg=$(mktemp "${TMPDIR:-/tmp}/rapid-msg.XXXXXX")
+  parent="$base"
+  for c in $(git rev-list --reverse "$base..HEAD"); do
+    if rqo=$(rapid_req_path "$c" "$slug"); then
+      GIT_INDEX_FILE="$idx" git read-tree "$c"
+      GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "100644,$(git rev-parse "$c:$rqo"),${rqo%/*}/$new.md"
+      GIT_INDEX_FILE="$idx" git update-index --force-remove "$rqo"
+      tree=$(GIT_INDEX_FILE="$idx" git write-tree)
+    else
+      tree=$(git rev-parse "$c^{tree}")
+    fi
+    git log -1 --format=%B "$c" > "$msg"
+    parent=$(GIT_AUTHOR_NAME="$(git log -1 --format=%an "$c")" GIT_AUTHOR_EMAIL="$(git log -1 --format=%ae "$c")" \
+      GIT_AUTHOR_DATE="$(git log -1 --format=%aI "$c")" git commit-tree "$tree" -p "$parent" -F "$msg")
+  done
+  rm -f "$idx" "$msg"
+  local oan num nl; oan=$(rapid_anchor_ref "$branch"); num=$(rapid_branch_number "$branch")
+  nl="${branch%/*}/${num:+$num.}$kind.$new"
+  git branch -m "$branch" "$nl"
+  git reset -q --keep "$parent"
+  # the new name keeps the branch's number and its very anchor (the number key names it); the old name stays too
+  if git rev-parse -q --verify "$oan" >/dev/null; then
+    git update-ref "$(rapid_anchor_ref "$nl")" "$(git rev-parse "$oan")" "$RAPID_ZERO" 2>/dev/null || true
+  else
+    rapid_anchor_make "$nl" "$base" >/dev/null
+  fi
+  rapid_info "renamed $branch -> $nl; the requirement file is $new.md throughout; the old tip is kept at $pf and the old anchor $oan stays"
 }
 
 # _not_landed: every branch dev does not hold, here or on origin as last

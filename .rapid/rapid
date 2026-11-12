@@ -14,6 +14,8 @@
 #                                      it also writes the safety anchor safety/v<series>/n<N>.<kind>.<name> (kept forever)
 #   rapid check [--gate NAME] [--each]   run a gate on the work tree, or the commit audit and the fast gate on
 #                                      every branch commit
+#   rapid check --audit [REV]            the commit audit (message rules, joiners, Cause and Fix,
+#                                      size, a behaviour change with its test) on the branch, or a merge's branch
 #   rapid land [-F BODY] [--dry-run] [--failed-gates-only] [--verbose]
 #                                      merge the current branch into dev once, tagged, then close the open
 #                                      batch: this branch and every one landed with --batch are tested once on
@@ -393,12 +395,37 @@ _landed_live() {
   return 0
 }
 
+# ---------------------------------------------------------------- check
+# _check_audit BASE TIP: the commit audit on every commit of BASE..TIP, in
+# order: the message rules (with the commit-audit smells: joiners, Cause and
+# Fix on a [FIX]) and the smells that read
+# the diff (size, a behaviour change with its test). Deterministic and free:
+# rapid check --each runs it before the gates, the forge's commit-audit job
+# runs it for every pushed branch and every new dev merge.
+_check_audit() {
+  local base="$1" tip="$2" c f out fails=0 ae ce
+  for c in $(git rev-list --reverse "$base..$tip"); do
+    f=$(mktemp "${TMPDIR:-/tmp}/rapid-msg.XXXXXX"); git log -1 --format=%B "$c" >"$f"
+    out=$(rapid_msg_violations "$f"); rm -f "$f"
+    ae=$(git log -1 --format=%ae "$c"); ce=$(git log -1 --format=%ce "$c")
+    out=$(printf '%s\n%s\n' "$out" "$(rapid_commit_smells "$c")" | sed '/^$/d')
+    if [ -n "$out" ]; then
+      fails=1; rapid_info "  FAIL  $(git rev-parse --short "$c") $(git log -1 --format=%s "$c")"
+      printf '%s\n' "$out" | sed 's/^/          - /'
+    else
+      rapid_info "  pass  $(git rev-parse --short "$c") $(git log -1 --format=%s "$c")"
+    fi
+  done
+  return "$fails"
+}
+
 cmd_check() {
   local gate=fast each=false root res
   while [ $# -gt 0 ]; do
     case "$1" in
       --gate) gate="${2:-}"; shift 2 ;;
       --each) each=true; shift ;;
+      --audit) shift; _check_audit_cmd "$@"; return ;;
       *) RAPID_RC=2 rapid_die "check: unknown argument $1" ;;
     esac
   done
@@ -406,12 +433,32 @@ cmd_check() {
   if $each; then
     git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch"
     rapid_info "-> commit audit"
+    RAPID_CONF_REV=dev _check_audit "$(git merge-base dev HEAD)" HEAD || rapid_die "check --each: a branch commit fails the commit audit (named above)"
     RAPID_CONF_REV=dev rapid_check_each "$(git merge-base dev HEAD)" HEAD || rapid_die "check --each failed"
     rapid_info "ok: every branch commit passes the fast gate or is a marked red commit"
     return 0
   fi
   res=$(rapid_gate "$gate" "$root") || rapid_die "gate $gate: fail"
   rapid_info "gate $gate: $res"
+}
+
+# _check_audit_cmd [REV]: rapid check --audit. REV (default HEAD) a merge: its
+# branch (REV^1..REV^2), checked by the conf and map at its first parent; else
+# the branch commits dev..REV, checked by dev's. Exit 1 on any finding.
+_check_audit_cmd() {
+  local rev="${1:-HEAD}" r p1
+  [ $# -le 1 ] || RAPID_RC=2 rapid_die "check --audit takes one revision"
+  cd "$(rapid_root)"
+  r=$(git rev-parse -q --verify "$rev^{commit}") || RAPID_RC=2 rapid_die "unknown revision $rev"
+  if [ "$(git rev-list --parents -n1 "$r" | wc -w | tr -d ' ')" = 3 ]; then
+    p1=$(git rev-parse "$r^1")
+    RAPID_CONF_REV="$p1" _check_audit "$p1" "$(git rev-parse "$r^2")" \
+      || rapid_die "check --audit: a commit of the branch merged by $(git rev-parse --short "$r") fails the commit audit"
+  else
+    git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch"
+    RAPID_CONF_REV=dev _check_audit "$(git merge-base dev "$r")" "$r" || rapid_die "check --audit: a branch commit fails the commit audit (named above)"
+  fi
+  rapid_info "ok: every commit passes the commit audit"
 }
 
 
@@ -940,6 +987,7 @@ _land_violations() {
     f=$(mktemp "${TMPDIR:-/tmp}/rapid-msg.XXXXXX"); git log -1 --format=%B "$c" >"$f"
     viol=$(rapid_msg_violations "$f"); rm -f "$f"
     [ -z "$viol" ] || echo "commit $sc breaks the message rules: $(tr '\n' ';' <<<"$viol")"
+    viol=$(rapid_commit_smells "$c"); [ -z "$viol" ] || echo "commit $sc fails the commit audit: $(tr '\n' ';' <<<"$viol")"
     viol=$(rapid_trailer "$c" Fixes)
     if [ -n "$viol" ]; then
       git rev-parse -q --verify "$viol^{commit}" >/dev/null && git merge-base --is-ancestor "$viol" "$dev_tip" \

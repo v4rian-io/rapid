@@ -20,6 +20,8 @@ base=HEAD
 case " $(ps -o args= -p "$PPID" 2>/dev/null || true) " in *" --amend "*) base=HEAD^ ;; esac
 if git rev-parse -q --verify "$base^{commit}" >/dev/null; then
   pr=0; [ -z "$(rapid_trailer "$base" Red)" ] || pr=1
+  sm=$(RAPID_CONF_REV="$(git rev-parse -q --verify refs/heads/dev || true)" rapid_diff_smells "$(grep -v '^#' "$1" | sed -n 1p)" "$(git diff --cached --numstat -M "$base")" "$pr" \
+    "$(grep -v '^#' "$1" | git interpret-trailers --parse | sed -nE 's/^Test: (.*)$/\1/p' | sed -n 1p)")
   out=$(printf '%s\n%s\n' "$out" "$sm" | sed '/^$/d')
 fi
 ai=$(git var GIT_AUTHOR_IDENT 2>/dev/null || true); ci=$(git var GIT_COMMITTER_IDENT 2>/dev/null || true)

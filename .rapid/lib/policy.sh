@@ -243,6 +243,85 @@ rapid_check_each() {
   return "$fails"
 }
 
+
+# Policy flips. .rapid/conf (every key above) and .rapid/admins (the admins, one
+# email per line, # comments allowed: the owner and whoever the owner adds) are
+# the policy files. A commit that changes one is a policy flip: its own [MODE]
+# commit, changing only policy files (and the requirement file of the branch,
+# which the first commit of a branch carries), authored and committed by an admin. Admins are read from
+# .rapid/admins: as committed at RAPID_CONF_REV when an admin shared the list, else the working copy's own
+# file, so a branch never makes
+# itself an admin. Under signed=required the flip is also signed by an admin
+# (rapid_flip_signer_problem): the email alone is whatever its author types. rapid setup writes its human runner, or the one --owner
+# names, as the first admin, in the working copy. With no admin
+# (a working copy an agent set up without --owner), rapid setup --owner EMAIL names one.
+RAPID_POLICY_FILES=".rapid/conf .rapid/admins .rapid/version"
+
+# rapid_admins: the admin emails at RAPID_CONF_REV (or in the work tree), one per line.
+rapid_admins() {
+  local text=""
+  if [ -n "${RAPID_CONF_REV:-}" ]; then
+    text=$(git show "$RAPID_CONF_REV:.rapid/admins" 2>/dev/null || true)
+  fi
+  # .rapid/admins is excluded from history: the working copy's own file names the admins
+  if [ -z "$text" ] && [ -f "$(rapid_ns)/admins" ]; then
+    text=$(cat "$(rapid_ns)/admins")
+  fi
+  grep -vE '^[[:space:]]*(#|$)' <<<"$text" | awk '{ print $1 }' || true
+}
+
+# rapid_policy_flip_problem SUBJECT FILES AE AN CE: empty when a commit with
+# SUBJECT changing FILES (whitespace separated), authored by AE (name AN) and
+# committed by CE, keeps the policy-flip rule at RAPID_CONF_REV; else one
+# reason per line.
+rapid_policy_flip_problem() {
+  local subj="$1" files="$2" ae="$3" an="$4" ce="$5" f pol=0 other=0 admins who names boot=0
+  names=$(sed 's/ /, /g' <<<"$RAPID_POLICY_FILES")
+  for f in $files; do
+    case " $RAPID_POLICY_FILES " in
+      *" $f "*) pol=1 ;;
+      *) case "$f" in .rapid/requirements/*.md) ;; *) other=1 ;; esac ;;   # the requirement of the branch rides along
+    esac
+  done
+  if [[ "$subj" == "[MODE] "* ]]; then
+    [ "$pol" = 1 ] || { echo "a [MODE] commit is a policy flip: it changes a policy file ($names), and this one changes none"; return 0; }
+    [ "$other" = 0 ] || echo "a [MODE] commit changes only policy files ($names) and the requirement of its branch; commit the other files apart"
+  elif [ "$pol" = 1 ]; then
+    echo "a change to a policy file ($names) is a policy flip: give it its own [MODE] commit"
+  else
+    return 0
+  fi
+  admins=$(rapid_admins)
+  if [ -z "$admins" ]; then
+    # no admin yet: the one flip allowed creates the admins file, and only that
+    [ "$(grep -vxE '[.]rapid/requirements/.*\.md' <<<"$(tr ' ' '\n' <<<"$files")" | sed '/^$/d')" = .rapid/admins ] \
+      && [ -z "$(git show "${RAPID_CONF_REV:-HEAD}:.rapid/admins" 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' || true)" ] && boot=1
+    if [ "$boot" = 0 ]; then
+      [ -z "${RAPID_ADMINS_NONE_OK:-}" ] || return 0
+      echo "no admin is listed in .rapid/admins; rapid setup --owner EMAIL names the owner"; return 0
+    fi
+  fi
+  [ "$boot" = 0 ] || return 0
+  for who in "$ae" "$ce"; do
+    grep -Fx -- "$who" <<<"$admins" >/dev/null \
+      || { echo "'${who:-<no identity>}' is not an admin (.rapid/admins: $(tr '\n' ' ' <<<"$admins" | sed 's/ $//')); an admin flips policy"; return 0; }
+  done
+  return 0
+}
+
+# rapid_policy_flip_commit C: rapid_policy_flip_problem for commit C (its subject,
+# the files it changes against its parent, its author and committer).
+rapid_policy_flip_commit() {
+  local who ae an ce subj files f flip=0
+  who=$(git log -1 --format='%ae%x09%an%x09%ce' "$1"); IFS=$'\t' read -r ae an ce <<<"$who"
+  subj=$(git log -1 --format=%s "$1"); files=$(git diff-tree --no-commit-id --name-only -r "$1")
+  rapid_policy_flip_problem "$subj" "$files" "$ae" "$an" "$ce"
+  ! grep -Fx .rapid/version <<<"$files" >/dev/null || rapid_pin_problem "$(git show "$1:.rapid/version" 2>/dev/null || true)"
+  [[ "$subj" != "[MODE] "* ]] || flip=1
+  for f in $files; do case " $RAPID_POLICY_FILES " in *" $f "*) flip=1 ;; esac; done
+  [ "$flip" = 0 ] || rapid_flip_signer_problem "$1"
+}
+
 # rapid_flip_signer_problem [COMMIT]: an email is whatever its author types, so under
 # signed=required at RAPID_CONF_REV a policy flip is signed by an admin: empty when
 # signed=required is off, no admin is listed yet, or the verified signer of COMMIT
@@ -251,6 +330,7 @@ rapid_check_each() {
 rapid_flip_signer_problem() {
   local rev="${RAPID_CONF_REV:-HEAD}" admins signer=""
   [ "$(rapid_conf signed optional)" = required ] || return 0
+  admins=$(rapid_admins); [ -n "$admins" ] || return 0
   [ -z "${1:-}" ] || signer=$(rapid_verified_signer commit "$1" "$rev")
   if [ -z "$signer" ]; then
     echo "the policy flip carries no signature git verifies$(! git cat-file -e "$rev:.rapid/signers" 2>/dev/null || echo " against .rapid/signers on dev") (signed=required): an admin signs a policy flip"

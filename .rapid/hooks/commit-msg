@@ -34,6 +34,7 @@ idp=""
 files=$(git diff --cached --name-only 2>/dev/null || true)
 hit=""; for f in $files; do case " $RAPID_POLICY_FILES " in *" $f "*) hit=1 ;; esac; done
 if [ -n "$hit" ]; then
+  pf=$(rapid_policy_flip_problem "$(grep -v '^#' "$1" | sed -n 1p)" "$files" "$ae" "$an" "$ce")
   pp=""; ! grep -Fx .rapid/version <<<"$files" >/dev/null || pp=$(rapid_pin_problem "$(git show :.rapid/version 2>/dev/null || true)")
   [ -z "$pp" ] || pf="${pf:+$pf
 }$pp"

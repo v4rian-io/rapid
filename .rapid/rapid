@@ -956,6 +956,7 @@ _land_violations() {
     else rprev=""; fi
   done
   [ -z "$rprev" ] || echo "commit $rprev carries Red: and a Red: commit cannot be the branch tip; add the commit that turns it green"
+  banned=$(git log --format= --name-only --diff-filter=ACMR "$dev_tip..$tip" | sort -u | while IFS= read -r f; do [ -z "$f" ] || rapid_banned "$f"; done)
   [ -z "$banned" ] || echo "the branch adds banned file(s): $(tr '\n' ' ' <<<"$banned")(secrets, keys, builds, .env, archives never enter history); drop them from the branch's commits"
   local rqp; rqp=$(rapid_req_path "$tip" "$slug" || true)
   if [ -n "$rqp" ] && req=$(git show "$tip:$rqp" 2>/dev/null); then

@@ -242,6 +242,23 @@ rapid_vault_ref() { local a; a=$(rapid_anchor_ref "$1"); printf 'refs/heads/vaul
 # rapid_anchor_refs REF: the refs that travel with branch REF: its anchor.
 rapid_anchor_refs() { rapid_anchor_ref "$1"; printf '\n'; }
 
+# Banned files: secrets, keys, certificates, build output,
+# dependency trees, archives and backups never enter history. The
+# pre-commit hook refuses them in the staged set (for humans as for agents,
+# whose guard already denies staging them), and land refuses a branch that
+# adds one past the hook. Removing such a file is always allowed.
+RAPID_BANNED_RE='(^|/)\.DS_Store$|(^|/)\.auth/|(^|/)keys/|\.(p8|p12|cer|pem|provisionprofile|mobileprovision)$|(^|/)build(-[^/]*)?/|(^|/)node_modules/|(^|/)\.env$|(^|/)\.env\.([^/]*)$|\.zip$|\.bak$'
+# rapid_banned PATH...: prints each PATH the banned list names (an .env.example,
+# .sample, .template or .dist file is a template, not a secret).
+rapid_banned() {
+  local p
+  for p in "$@"; do
+    [[ "$p" =~ $RAPID_BANNED_RE ]] || continue
+    [[ "$p" =~ (^|/)\.env\.(example|sample|template|dist)$ ]] && continue
+    printf '%s\n' "$p"
+  done
+}
+
 # rapid_lock_lift PATH WHAT: every rapid lock holds its holder's pid (a file whose first word is
 # it). 0 when PATH is free, or its holder is gone: the lock is then lifted and the lift logged in
 # <git common dir>/rapid/log ("<UTC> lifted <lock>: holder pid <p> gone (<WHAT>, pid <self>)");

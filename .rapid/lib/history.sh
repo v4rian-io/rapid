@@ -396,6 +396,42 @@ rapid_history_check() {
   return 0
 }
 
+# rapid_exceptions [DEV]: one line per kind of exception the rules let land,
+# "<kind>: <n> merge(s): <versions>", for merges carrying Bulk:, Untested:,
+# Gate-Change: or Docs: none, for merges of a batch its close gated (batch-close)
+# and for merges no gate ran on (no-gate). The
+# history audit prints it so every exception is visible from one command.
+rapid_exceptions() {
+  local dev="${1:-dev}" root v kind out
+  root=$(rapid_dev_root "$dev")
+  # one git call for every merge's trailers (%(trailers:only,unfold) is what
+  # interpret-trailers --parse reads) and one for the versions (rapid_version_map)
+  out=$(git log --first-parent --reverse --format='%x1e%H %h%n%(trailers:only,unfold)' "$root..$dev" \
+    | RAPID_VMAP="$(rapid_version_map)" awk -v root="$root" 'BEGIN { RS = "\036"; n = split(ENVIRON["RAPID_VMAP"], L, "\n")
+        for (i = 1; i <= n; i++) if (split(L[i], a, " ") == 2) ver[a[1]] = a[2] }
+      NF { k = split($0, l, "\n"); split(l[1], h, " "); if (h[1] == root) next
+        v = (h[1] in ver) ? ver[h[1]] : h[2]; b = u = gc = dn = 0; g = ""; gg = 0
+        for (i = 2; i <= k; i++) {
+          if (l[i] ~ /^Bulk: /) b = 1; if (l[i] ~ /^Untested: /) u = 1; if (l[i] ~ /^Gate-Change: /) gc = 1
+          if (l[i] ~ /^Docs: none/) dn = 1;
+          if (!gg && l[i] ~ /^Gates: /) { g = substr(l[i], 8); gg = 1 } }
+        if (b) print "bulk", v; if (u) print "untested", v; if (gc) print "gate-change", v
+        if (dn) print "docs-none", v
+        if (g ~ /^deferred to the close of batch /) { split(g, w, " "); print "batch:" w[7], v, h[1] } else if (g !~ /=pass/) print "no-gate", v }')
+  # a batch merge counts by what its close ran: a gate (batch-close), or none configured (no-gate)
+  local bid bk blast bnote
+  for bid in $(awk '$1 ~ /^batch:/ { print substr($1, 7) }' <<<"$out" | sort -u); do
+    blast=$(awk -v b="batch:$bid" '$1 == b { s = $3 } END { print s }' <<<"$out"); bk=batch-close
+    bnote=$(git notes --ref=gates show "$blast" 2>/dev/null || true)
+    if grep -q '^exit=none (no gate configured)$' <<<"$bnote" && ! grep -q '^exit=0$' <<<"$bnote"; then bk=no-gate; fi
+    out=$(sed "s/^batch:$bid /$bk /" <<<"$out")
+  done
+  for kind in bulk untested gate-change docs-none batch-close no-gate; do
+    v=$(awk -v k="$kind" '$1 == k { printf " %s", $2 }' <<<"$out")
+    [ -z "$v" ] || printf '%s: %s merge(s):%s\n' "$kind" "$(wc -w <<<"$v" | tr -d ' ')" "$v"
+  done
+}
+
 # rapid_slug_landed NAME [DEV]: 0 when DEV's first-parent line holds a merge of NAME.
 rapid_slug_landed() {
   git log --first-parent --format=%s "${2:-dev}" 2>/dev/null | grep -E "^\[MERGE\] pool/[^ ]*[.]$1 into dev: " >/dev/null

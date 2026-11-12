@@ -1590,6 +1590,7 @@ cmd_doctor() {
   if [ "${1:-}" = "--history-only" ]; then
     local rapid_live="${RAPID_VERBOSE:-}"
     out=$(RAPID_CONF_REV="" rapid_history_check dev main)
+    rapid_exceptions dev | sed 's/^/doctor: exceptions: /'
     if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/doctor: /'; return 1; fi
     rapid_info "doctor: ok (history I1-I9 hold)"; return 0
   fi
@@ -1628,6 +1629,7 @@ cmd_doctor() {
   [ -z "$ul" ] || rapid_info "doctor: branches not landed yet: $(tr '\n' ' ' <<<"$ul")"
   if $history; then
     # what the rules let land as an exception, by kind, from one command (information, not a failure)
+    rapid_exceptions dev | sed 's/^/doctor: exceptions: /'
     # the checkpoint: start after the last merge this clone fully verified,
     # unless --since or --all says otherwise or the note is no longer trusted
     # (lib/history.sh, rapid_history_checkpoint, says when and why)

@@ -454,6 +454,15 @@ _body_text() {
       e -= n; while (e > 0 && l[e] ~ /^[[:space:]]*$/) e--
       for (i = 1; i <= e; i++) print l[i] }'
 }
+# _body_thin MSGFILE: a merge body too thin to say anything: the paragraph
+# needs three words and the list one item of two words or more.
+_body_thin() {
+  local b para
+  b=$(sed '1,2d' "$1" | grep -vE '^[A-Z][A-Za-z-]+: ' || true)
+  para=$(awk 'NF == 0 { exit } { print }' <<<"$b")
+  [ "$(wc -w <<<"$para" | tr -d ' ')" -ge 3 ] || echo "merge body paragraph says too little (three words at least)"
+  grep -E '^- +[^ ]+ +[^ ]' <<<"$b" >/dev/null || echo "merge body list needs an item of two words or more"
+}
 
 # _batch_close: gate the batch's final dev tree once (gates_full); on a
 # pass publish every merge, tag and ref the batch made in one atomic push, on a
@@ -929,6 +938,7 @@ _land_violations() {
   for c in $(git rev-list --reverse --no-merges "$dev_tip..$tip"); do
     sc=$(git rev-parse --short "$c")
     f=$(mktemp "${TMPDIR:-/tmp}/rapid-msg.XXXXXX"); git log -1 --format=%B "$c" >"$f"
+    viol=$(rapid_msg_violations "$f"); rm -f "$f"
     [ -z "$viol" ] || echo "commit $sc breaks the message rules: $(tr '\n' ';' <<<"$viol")"
     viol=$(rapid_trailer "$c" Fixes)
     if [ -n "$viol" ]; then
@@ -997,6 +1007,7 @@ _land_violations() {
   msg=$(mktemp "${TMPDIR:-/tmp}/rapid-merge.XXXXXX")
   _land_msg "$branch" "$next" "$body_file" "$tip" "$dev_tip" "deferred to the close of batch 0000000" Merge-Tree "$(git rev-parse "$tip^{tree}")" \
     "$(rapid_branch_number "$branch")" "$ticket" "$req_test" "$docs" "$extra" > "$msg"
+  viol=$(rapid_msg_violations "$msg" merge; _body_thin "$msg"); rm -f "$msg"
   [ -z "$viol" ] || echo "merge message: $(tr '\n' ';' <<<"$viol")"
   return 0
 }
@@ -1183,6 +1194,7 @@ $(sed 's/^/  - /' <<<"$out")"
   anchors="$anchor:$anchor"
   msg=$(mktemp "${TMPDIR:-/tmp}/rapid-merge.XXXXXX")
   _land_msg "$branch" "$next" "$body_file" HEAD "$dev_tip" "$gates" "$tkey" "$tree" "$lnum" "$ticket" "$req_test" "$docs" "$extra" > "$msg"
+  out=$(rapid_msg_violations "$msg" merge; _body_thin "$msg")
   [ -z "$out" ] || { rm -f "$msg"; rapid_die "merge message: $(tr '\n' ';' <<<"$out")"; }
   if $dry; then
     rapid_info "dry run: would land $branch as $next (gates $gates), message:"; sed 's/^/  | /' "$msg"; rm -f "$msg"; [ -z "$gr" ] || rm -rf "$gr"; return 0

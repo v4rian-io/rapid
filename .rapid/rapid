@@ -50,6 +50,7 @@
 #                                      main is production: only the owner promotes (release_who), never an agent;
 #                                      with release_build, the artifacts built on the tag, gated and listed in it
 #   rapid release --publish [VERSION]    ship a release's gated artifacts again (release_publish, the forge's release)
+#   rapid release --of REV               the release that first shipped REV (release/<v>), or "unreleased"; read-only
 #   rapid changelog [--from REV] [TO]    the changelog from history up to TO (default dev's tip), after REV:
 #                                      each landed merge by release, version, kind/name and its requirement
 #   rapid version [--next] [--at REV]    the last version on dev; --next: the one the next land takes;
@@ -2039,6 +2040,7 @@ cmd_release() {
       --dry-run) dry=true; RAPID_DRY=1; shift ;;
       --verbose) export RAPID_VERBOSE=1; shift ;;
       --publish) publish=true; shift ;;
+      --of) shift; _release_of "$@"; return ;;
       -*) RAPID_RC=2 rapid_die "release: unknown argument $1" ;;
       *) want="$1"; shift ;;
     esac
@@ -2603,6 +2605,35 @@ cmd_version() {
       [ -n "$v" ] || rapid_die "$rev reached dev at $(git rev-parse --short "$c"), which carries no version"
       rapid_info "$v" ;;
   esac
+}
+
+# ==== release --of
+# _release_of REV: rapid release --of REV. The release that first shipped REV:
+# the first commit at or after REV's land on dev's first-parent line that
+# carries a release/<v> tag (a release merge on main answers its own
+# release). Prints release/<v>, or one "unreleased (...)"
+# line when dev does not hold REV or no release holds it yet. Read-only;
+# exit 0 either way, 2 for a revision git does not know.
+_release_of() {
+  local rev="${1:-}" root c l v out
+  [ -n "$rev" ] && [ $# = 1 ] || RAPID_RC=2 rapid_die "release --of names one revision"
+  root=$(rapid_root); cd "$root"
+  git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
+  c=$(git rev-parse -q --verify "$rev^{commit}") || RAPID_RC=2 rapid_die "unknown revision $rev"
+  l=$(_landed_at "$c")
+  # a release merge on main answers for the dev commit it released (its second parent)
+  if [ -z "$l" ] && [[ "$(git log -1 --format=%s "$c")" == "[MERGE] dev into main: "* ]] && git rev-parse -q --verify "$c^2" >/dev/null; then
+    l=$(_landed_at "$(git rev-parse "$c^2")")
+  fi
+  if [ -z "$l" ]; then rapid_info "unreleased ($rev is not on dev)"; return 0; fi
+  out=$({ git for-each-ref --format='%(objecttype) %(objectname) %(*objectname) %(refname:short)' 'refs/tags/release/'; echo --
+          echo "$l"; git rev-list --first-parent --reverse "$l..dev"; } \
+    | awk '$0 == "--" { fp = 1; next }
+           !fp { if ($1 == "tag") rel[$3] = $4; else rel[$2] = $3; next }
+           !hit && ($0 in rel) { print rel[$0]; hit = 1 }')
+  if [ -n "$out" ]; then rapid_info "$out"; return 0; fi
+  v=$(rapid_version_of "$l")
+  rapid_info "unreleased ($rev landed as ${v:-$(git rev-parse --short "$l")}; no release holds it yet)"
 }
 
 # A clone that never ran rapid setup has no hooks and maybe no dev: the verbs

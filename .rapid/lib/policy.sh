@@ -158,6 +158,30 @@ rapid_signed_problem() {
   esac
 }
 
+# rapid_release_signed GOV TIP: 0 when signed=required at GOV (the main a release
+# moves from) or at TIP (the released commit): the release tag must be signed.
+rapid_release_signed() {
+  [ "$(RAPID_CONF_REV="$1" rapid_conf signed optional)" = required ] || [ "$(RAPID_CONF_REV="$2" rapid_conf signed optional)" = required ]
+}
+
+# rapid_release_sig_problem TAGREF GOV TIP: empty unless signed=required (at GOV
+# or TIP) and the release tag carries no good signature, or its signer may not
+# release by the policy at GOV. The signer is the verified principal (ssh) or
+# the GOODSIG email (gpg). The keys come from .rapid/signers committed at GOV
+# (git's allowed signers format, "<email> <keytype> <key>") when it exists:
+# main moves only by a release, so only the owner changes them; without it
+# git's own config verifies, which the releaser's machine controls.
+rapid_release_sig_problem() {
+  local t="$1" gov="$2" tip="$3" signer why
+  rapid_release_signed "$gov" "$tip" || return 0
+  signer=$(rapid_verified_signer tag "$t" "$gov")
+  if [ -z "$signer" ]; then
+    echo "${t#refs/tags/} carries no signature git verifies$(! git cat-file -e "$gov:.rapid/signers" 2>/dev/null || echo " against .rapid/signers at main") (signed=required): the owner signs it, as rapid release does under signed=required"
+    return 0
+  fi
+  why=$(rapid_policy_may_release "$gov" "$tip" "$signer") || echo "${t#refs/tags/} is signed by '$signer': $why"
+}
+
 # rapid_verified_signer tag|commit OBJECT REV: who signed OBJECT, as git verifies it: the
 # principal (ssh) or the GOODSIG email (gpg); empty without a good signature. The keys come
 # from .rapid/signers committed at REV when it exists, else from git's own config.

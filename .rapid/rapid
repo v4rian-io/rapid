@@ -2106,6 +2106,7 @@ cmd_release() {
   fi
   git worktree remove --force "$wt" >/dev/null 2>&1 || true
   # signed=required: the release tag is signed, and its signer must be one who may release (as pre-push and I5 check)
+  local sign=-a; ! rapid_release_signed "$main_old" "$dev_tip" || sign=-s
   if $dry && [ -n "$why" ]; then
     rapid_info "dry run: release gate on $v, but the release itself would be refused: $why"; [ -z "$manifest" ] || rm -rf "$adir"; return 0
   fi
@@ -2122,6 +2123,7 @@ Gates: $gates
 Tested-Tree: $(git rev-parse "$dev_tip^{tree}")
 Released-By: $ce${manifest:+
 $manifest}" "$dev_tip" || rapid_die "could not make the release tag$([ "$sign" = -s ] && echo ' (signed=required: git tag -s needs your signing key, user.signingkey)'); main and tags are unchanged"
+  why=$(rapid_release_sig_problem "refs/tags/release/$v" "$main_old" "$dev_tip")
   if [ -n "$why" ]; then git tag -d "release/$v" >/dev/null; rapid_die "policy: $why; main and tags are unchanged"; fi
   # main takes dev by a --no-ff release merge, so main's first-parent line is the list of releases
   local rmsg rmc

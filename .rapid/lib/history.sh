@@ -351,6 +351,7 @@ rapid_history_check() {
         tagger=$(git for-each-ref --format='%(taggeremail)' "$rt" | tr -d '<>')
         # a copy that names no admin (a CI checkout) leaves the owner to the forge, whose rulesets let only an admin release
         why=$(RAPID_ADMINS_NONE_OK=1 rapid_policy_may_release "$gov" "$c" "$tagger") || echo "I5 $c release/$v tagged by '${tagger:-<none>}': $why"
+        why=$(rapid_release_sig_problem "$rt" "$gov" "$c"); [ -z "$why" ] || echo "I5 $c $why"
       fi
     fi
     gov="$c"

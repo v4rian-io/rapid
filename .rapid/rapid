@@ -6,6 +6,8 @@
 #   rapid setup --owner EMAIL [--owner-name NAME]
 #                                      the first setup names EMAIL the owner, the first admin, never its runner
 #                                      (NAME: the owner's name, beside the address)
+#   rapid setup --pin VERSION            pin VERSION, a tag the installed rapid holds, in .rapid/version
+#                                      (without it: the newest release)
 #   rapid setup --require-test          the first setup writes requirement_test=required: every branch states
 #                                      its requirement and its test (later: a [MODE] change of .rapid/conf)
 #   rapid setup --install                link rapid into a bin directory of PATH (~/.local/bin),
@@ -79,6 +81,10 @@
 #   rapid doctor --history-only          invariants I1 to I9 only (CI: no hooks on the runner);
 #                                      the merges are checked at once, one worker per core (RAPID_HISTORY_JOBS)
 #   rapid doctor --verify [SINCE]         run again, on the own tree of each merge, what its test record names (after SINCE)
+#   rapid hook NAME [ARGS...]            run rapid's own hook NAME (commit-msg, pre-commit, pre-push, prepare-commit-msg)
+#                                      for this repository: what the hook stubs of an installed repository call
+#   rapid upgrade [VERSION]              on a branch: fetch the tags of the installed rapid and pin VERSION, by default
+#                                      the newest release, in .rapid/version when it is higher than the pin; commit, land
 #   rapid -h | --help
 #
 # kinds: feature fix r&d refactor docs test. names: a-z, 0-9 and -, 2 to 48 chars.
@@ -108,8 +114,11 @@ if [ -f "$RAPID_SELF/lib/pin.sh" ]; then
   . "$RAPID_SELF/lib/pin.sh"
   case "${1:-}" in
     -h|--help|"") ;;
+    land|hook) rapid_pin_exec "$RAPID_SELF" 1 "$@" ;;
+    setup) [ "${2:-}" = --install ] || rapid_pin_exec "$RAPID_SELF" 0 "$@" ;;
     # the installed rapid moves the pin itself: the pinned version may predate the verb
     upgrade) ;;
+    *) rapid_pin_exec "$RAPID_SELF" 0 "$@" ;;
   esac
 fi
 # a land is checked by dev's framework, never by the branch's own copy (lib/devexec.sh)
@@ -214,6 +223,7 @@ _setup_install() {
   local self bin="" d link cur
   self="$(cd "$RAPID_SELF" && pwd -P)/rapid"
   # this clone's own state (backup zips, kept versions) is no part of its tree
+  rapid_exclude "${self%/.rapid/rapid}/.git" baks/ .rapid-versions/
   for d in "$HOME/.local/bin"; do
     case ":$PATH:" in *":$d:"*) bin="$d"; break ;; esac
   done
@@ -246,6 +256,7 @@ cmd_setup() {
   local root email tree root_c
   root=$(rapid_root); cd "$root"
   # the admins are this working copy's own configuration: excluded by default (an admin may commit them)
+  rapid_exclude "$(git rev-parse --path-format=absolute --git-common-dir)" .rapid/admins
   # the framework's own repository (it holds .rapid/rapid) is seeded before its own branches
   # bring the files its gates name; anywhere else a gate naming a missing file is refused
   local miss=""; [ -f .rapid/rapid ] || miss=$(RAPID_CONF_REV="" rapid_gate_missing "$root")
@@ -253,6 +264,7 @@ cmd_setup() {
     printf '%s\n' "$miss" | sed 's/^/  /' >&2
     rapid_die "set your own gates in .rapid/conf first (gates_fast, gates_full, gates_release: one shell command each, exit 0 passes; gates_full=none lands without a full gate)"
   fi
+  if _setup_installed "$root"; then _setup_stubs "$root"; else git config core.hooksPath .rapid/hooks; fi
   email=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -E 's/.*<([^>]*)>.*/\1/') || email=""
   local uname; uname=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -E 's/^(.*) <[^>]*>.*$/\1/') || uname=""
   _setup_conf_write
@@ -332,6 +344,56 @@ cmd_setup() {
       rapid_info "seeded origin with:$need${tags:+ plus the tags on dev}"
     fi
   fi
+  if _setup_installed "$root"; then
+    rapid_info "ok: hooks active (stubs that run rapid hook), rapid $(sed -n 1p .rapid/version) pinned in .rapid/version"
+  else
+    rapid_info "ok: hooks active (.rapid/hooks)"
+  fi
+}
+
+# _setup_installed ROOT: ROOT is served by an installed rapid (lib/pin.sh): it carries no
+# rapid of its own, and the running one lives elsewhere.
+_setup_installed() { [ ! -e "$1/.rapid/rapid" ] && [ "$RAPID_SELF" != "$1/.rapid" ]; }
+
+# _setup_stubs ROOT: the installed mode of rapid setup. .rapid/version pins the newest release
+# tag of the running tool (kept when it is there already), or the tag rapid setup --pin
+# names, which the install holds, and the hooks are stubs in the git
+# directory, each handing its arguments to `rapid hook <name>`: no framework file is copied
+# into the repository.
+_setup_stubs() {
+  local root="$1" tag d h clone
+  mkdir -p "$root/.rapid"
+  if [ -n "${_setup_pin:-}" ]; then
+    clone=$(rapid_tool_clone "$RAPID_SELF")
+    rapid_pin_ok "$_setup_pin" || RAPID_RC=2 rapid_die ".rapid/version holds '$_setup_pin', not a version tag (v<series>.<n>)"
+    _pin_tool_git "$clone" rev-parse -q --verify "refs/tags/$_setup_pin^{commit}" >/dev/null 2>&1 \
+      || rapid_die "$_setup_pin is not in the installed rapid"
+    printf '%s\n' "$_setup_pin" > "$root/.rapid/version"
+  elif [ ! -f "$root/.rapid/version" ]; then
+    tag=$(rapid_tool_tag "$RAPID_SELF")
+    [ -n "$tag" ] || rapid_die "no release to pin by default; use --pin VERSION"
+    printf '%s\n' "$tag" > "$root/.rapid/version"
+  fi
+  d=$(rapid_stub_dir); mkdir -p "$d"
+  for h in "$RAPID_SELF"/hooks/*; do
+    h="${h##*/}"
+    printf '%s\n' '#!/bin/sh' "# rapid hook stub: the installed rapid runs its own $h for this repository" \
+      'command -v rapid >/dev/null 2>&1 || { echo "X rapid is not on PATH: install it (rapid setup --install in its clone), then try again" >&2; exit 1; }' \
+      "exec rapid hook $h \"\$@\"" > "$d/$h"
+    chmod +x "$d/$h"
+  done
+  git config core.hooksPath "$d"
+}
+
+# cmd_hook NAME [ARGS...]: rapid hook. Runs the tool's own hook NAME for the repository of
+# the current directory, with the arguments, the stdin and the exit code of the hook.
+cmd_hook() {
+  local name="${1:-}"
+  [ -n "$name" ] || RAPID_RC=2 rapid_die "hook: name the hook to run"
+  shift
+  case "$name" in */*|.*) RAPID_RC=2 rapid_die "hook: unknown hook $name" ;; esac
+  [ -f "$RAPID_SELF/hooks/$name" ] || RAPID_RC=2 rapid_die "hook: unknown hook $name"
+  exec bash "$RAPID_SELF/hooks/$name" "$@"
 }
 
 # _setup_agent [claude] [--uninstall] [--dry-run] [--prefix DIR]: the
@@ -2857,9 +2919,13 @@ cmd_doctor() {
     if [ -n "$out" ]; then printf '%s\n' "$out" | sed 's/^/doctor: /'; return 1; fi
     rapid_info "doctor: ok (history I1-I9 hold)"; return 0
   fi
+  local inst=false; ! rapid_installed_root >/dev/null 2>&1 || inst=true
   if $inst; then
     # an installed repository (lib/pin.sh): its hooks are the stubs in the git directory
+    [ "${1:-}" != "--fix" ] || { _setup_stubs "$root" && rapid_info "doctor --fix: the hook stubs are written"; }
     hp=$(git config --get core.hooksPath || true)
+    [ "$hp" = "$(rapid_stub_dir)" ] || { rapid_info "doctor: core.hooksPath is '${hp:-unset}', want the hook stubs (rapid setup)"; bad=1; }
+    for k in "$RAPID_SELF"/hooks/*; do [ -x "$(rapid_stub_dir)/${k##*/}" ] || { rapid_info "doctor: the hook stub ${k##*/} is missing (rapid setup)"; bad=1; }; done
   elif [ "${1:-}" = "--fix" ]; then
     git config core.hooksPath .rapid/hooks && rapid_info "doctor --fix: core.hooksPath set to .rapid/hooks"
     for k in .rapid/hooks/* .rapid/rapid; do [ -x "$k" ] || { chmod +x "$k" && rapid_info "doctor --fix: made $k executable"; }; done
@@ -3014,6 +3080,46 @@ cmd_queue() {
   rm -rf "$d"
 }
 
+# ==== upgrade
+# ---------------------------------------------------------------- upgrade
+# _pin_num PIN: the version numbers of a pin (release/v2026.1.2 -> 2026 1 2).
+_pin_num() { printf '%s' "${1#release/}" | sed 's/^v//; s/[.]/ /g'; }
+
+# rapid upgrade [VERSION]: on a branch of an installed repository, fetch the tags of the clone the
+# pin resolves from, then write VERSION (by default the newest release tag it holds) into
+# .rapid/version when it is higher than the pin there. The branch then commits and lands it: it
+# lands under the version dev pins. rapid's own repository runs its own .rapid: nothing to pin.
+cmd_upgrade() {
+  local root clone cur want b a c
+  [ $# -le 1 ] || RAPID_RC=2 rapid_die "upgrade: unknown argument $2"
+  case "${1:-}" in -*) RAPID_RC=2 rapid_die "upgrade: unknown argument $1" ;; esac
+  root=$(rapid_root); cd "$root"
+  [ ! -e .rapid/rapid ] || rapid_die "upgrade: this repository holds its own rapid (.rapid/rapid); it pins no version"
+  [ -f .rapid/version ] || rapid_die "upgrade: no .rapid/version here; run rapid setup first"
+  b=$(git symbolic-ref -q --short HEAD || true)
+  rapid_branch_parse "$b" >/dev/null 2>&1 || rapid_die "upgrade: open a branch first: rapid branch refactor upgrade-rapid"
+  clone=$(rapid_tool_clone "$RAPID_SELF")
+  if _pin_tool_git "$clone" remote get-url origin >/dev/null 2>&1; then
+    _pin_tool_git "$clone" fetch -q --tags origin || rapid_die "upgrade: could not fetch the tags of the installed rapid ($clone)"
+  fi
+  want="${1:-}"
+  if [ -z "$want" ]; then
+    want=$(_pin_tool_git "$clone" tag -l 'release/v[0-9]*' --sort=-v:refname | sed -n 1p)
+    [ -n "$want" ] || rapid_die "upgrade: the installed rapid holds no release; name a VERSION"
+  fi
+  rapid_pin_ok "$want" || RAPID_RC=2 rapid_die "upgrade: '$want' is not a version tag (v<series>.<n>)"
+  _pin_tool_git "$clone" rev-parse -q --verify "refs/tags/$want^{commit}" >/dev/null 2>&1 \
+    || rapid_die "$want is not in the installed rapid"
+  cur=$(sed -n 1p .rapid/version | tr -d '[:space:]')
+  # higher: the first number that differs is larger (a missing number counts as 0)
+  c=$(awk -v a="$(_pin_num "$want")" -v b="$(_pin_num "$cur")" 'BEGIN { n = split(a, x, " "); m = split(b, y, " "); k = n > m ? n : m
+      for (i = 1; i <= k; i++) { if (x[i] + 0 > y[i] + 0) { print 1; exit } if (x[i] + 0 < y[i] + 0) { print 0; exit } } print 0 }')
+  [ "$c" = 1 ] || rapid_die "upgrade: $want is not higher than the pinned $cur"
+  printf '%s\n' "$want" > .rapid/version
+
+  rapid_info "upgrade: $cur -> $want (.rapid/version); an admin commits it as [MODE] and lands the branch"
+}
+
 # ==== version
 # ---------------------------------------------------------------- version
 # _landed_at REV: the commit on dev's first-parent line that first held REV
@@ -3149,6 +3255,11 @@ Notify:$mentions"
 # runner that has no hooks); status says what is missing.
 _need_setup() {
   local hp; hp=$(git config --get core.hooksPath 2>/dev/null || true)
+  if rapid_installed_root >/dev/null 2>&1; then
+    [ "$hp" = "$(rapid_stub_dir)" ] || { echo "core.hooksPath is '${hp:-unset}', so no rapid hook guards this clone"; return 0; }
+  else
+    [ "$hp" = .rapid/hooks ] || { echo "core.hooksPath is '${hp:-unset}', so no rapid hook guards this clone"; return 0; }
+  fi
   git rev-parse -q --verify refs/heads/dev >/dev/null || { echo "this clone has no dev branch"; return 0; }
 }
 
@@ -3171,7 +3282,9 @@ case "${1:-}" in
   bisect) shift; cmd_bisect "$@" ;;
   status) shift; cmd_status "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
+  upgrade) shift; cmd_upgrade "$@" ;;
   version) shift; cmd_version "$@" ;;
+  hook) shift; cmd_hook "$@" ;;
   queue) shift; cmd_queue "$@" ;;
   commit) shift; cmd_commit "$@" ;;
   -h|--help) usage 0 ;;

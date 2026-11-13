@@ -10,6 +10,8 @@
 #                                      its requirement and its test (later: a [MODE] change of .rapid/conf)
 #   rapid setup --install                link rapid into a bin directory of PATH (~/.local/bin),
 #                                      from wherever this copy stands; nothing is copied
+#   rapid setup --agent [claude] [--uninstall] [--dry-run] [--prefix DIR]
+#                                      install (or remove) the agent guard for Claude Code
 #   rapid setup --remote [--repo OWNER/REPO] [--dry-run]
 #                                      apply the forge rulesets and write the rapid-check workflow (gh)
 #   rapid branch <kind> <name> [-r TEXT] [--test PATH] [--ticket ID]
@@ -231,6 +233,7 @@ _setup_install() {
 
 cmd_setup() {
   case "${1:-}" in
+    --agent) shift; _setup_agent "$@"; return ;;
     --remote) shift; _setup_remote "$@"; return ;;
     --install) shift; _setup_install "$@"; return ;;
     --owner|--owner-name|--require-test|--pin) _setup_owner_args "$@" ;;
@@ -326,6 +329,21 @@ cmd_setup() {
       rapid_info "seeded origin with:$need${tags:+ plus the tags on dev}"
     fi
   fi
+}
+
+# _setup_agent [claude] [--uninstall] [--dry-run] [--prefix DIR]: the
+# agent guard (.rapid/agent/install) for Claude Code, the one agent it serves.
+_setup_agent() {
+  local args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      claude) args+=("--$1"); shift ;;
+      --uninstall|--dry-run) args+=("$1"); shift ;;
+      --prefix) [ -n "${2:-}" ] || RAPID_RC=2 rapid_die "setup --agent: --prefix needs a directory"; args+=(--prefix "$2"); shift 2 ;;
+      *) RAPID_RC=2 rapid_die "setup --agent: unknown argument $1" ;;
+    esac
+  done
+  "$RAPID_SELF/agent/install" ${args[@]+"${args[@]}"}
 }
 
 # _setup_remote [--repo OWNER/REPO] [--dry-run]: the forge side, through gh.

@@ -21,6 +21,9 @@
 #                                      it also writes the safety anchor safety/v<series>/n<N>.<kind>.<name> (kept forever)
 #   rapid branch --rename NEW_NAME         give the current branch a new name (requirements file follows)
 #   rapid branch --delete-landed [BRANCH...]        an admin deletes landed branches still on origin (the forge lets only admins)
+#   rapid branch --reject [BRANCH] --reason TEXT [--mention LOGIN] [--dry-run]
+#                                      close the branch's open PR as a rejection (one comment: reason, reviewer,
+#                                      a record line); the branch and its safety anchor are kept (gh)
 #   rapid check [--gate NAME] [--each]   run a gate on the work tree, or the commit audit and the fast gate on
 #                                      every branch commit
 #   rapid check --reqs [--save [FILE]]   print the requirements register, built from .rapid/requirements/ on the spot
@@ -554,6 +557,7 @@ cmd_branch() {
   case "${1:-}" in
     --rename) shift; _branch_rename "$@"; return ;;
     --delete-landed) shift; _branch_delete_landed "$@"; return ;;
+    --reject) shift; _branch_reject "$@"; return ;;
     ""|-h|--help) usage 2 ;;
   esac
   local kind="$1" slug="${2:-}" req="" ticket="" req_test="" root
@@ -2845,6 +2849,59 @@ _release_of() {
   if [ -n "$out" ]; then rapid_info "$out"; return 0; fi
   v=$(rapid_version_of "$l")
   rapid_info "unreleased ($rev landed as ${v:-$(git rev-parse --short "$l")}; no release holds it yet)"
+}
+
+# ==== branch --reject
+# _branch_reject [BRANCH] --reason TEXT [--mention LOGIN]... [--dry-run]: rapid
+# branch --reject. Close the open PR of a branch (the current one, or BRANCH: a
+# branch or name) as a rejection: one "## REJECTION" comment with the reason,
+# the reviewer, the logins to notify and a hidden record line tools can read
+#   <!-- rejection pr=<N> reviewer=<login> branch=<branch> at=<UTC> -->
+# then the PR is closed. The branch is never deleted, here or on origin, and
+# its safety anchor stays: the author pushes fixes to the same branch and runs
+# rapid land --pr again, which opens a new PR. Needs origin and the gh CLI.
+_branch_reject() {
+  local branch="" reason="" mentions="" dry=false root repo n who at body
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) [ $# -ge 2 ] || RAPID_RC=2 rapid_die "branch --reject: --reason needs a text"; reason="$2"; shift 2 ;;
+      --mention) [ -n "${2:-}" ] || RAPID_RC=2 rapid_die "branch --reject: --mention needs a login"; mentions="$mentions @${2#@}"; shift 2 ;;
+      --dry-run) dry=true; shift ;;
+      -*) RAPID_RC=2 rapid_die "branch --reject: unknown argument $1" ;;
+      *) [ -z "$branch" ] || RAPID_RC=2 rapid_die "branch --reject names one branch at most"; branch="$1"; shift ;;
+    esac
+  done
+  [ -n "$(printf '%s' "$reason" | tr -d '[:space:]')" ] \
+    || RAPID_RC=2 rapid_die "branch --reject: --reason is required; the author needs to know what to fix"
+  root=$(rapid_root); cd "$root"
+  if [ -z "$branch" ]; then branch=$(rapid_branch)
+  elif ! git rev-parse -q --verify "refs/heads/${branch#refs/heads/}" >/dev/null; then
+    n=$(_branch_ref "$branch" || true); branch="${n:-$branch}"
+  fi
+  branch="${branch#refs/heads/}"
+  rapid_branch_parse "$branch" >/dev/null 2>&1 || RAPID_RC=2 rapid_die "'$branch' is no pool/v<series>/n<N>.<kind>.<name> branch; name the branch to reject"
+  rapid_has_remote || rapid_die "branch --reject needs an origin remote"
+  command -v gh >/dev/null 2>&1 || rapid_die "branch --reject needs the gh CLI"
+  repo=$(_forge_repo)
+  n=$(gh pr list --repo "$repo" --head "$branch" --base dev --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+  [[ "$n" =~ ^[0-9]+$ ]] || rapid_die "$branch has no open PR on $repo; only an open PR can be rejected"
+  who=$(gh api user --jq .login 2>/dev/null || true); [ -n "$who" ] || who=unknown
+  at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  body="## REJECTION
+
+Reason: $reason
+Reviewer: @$who
+Branch: $branch (kept on origin: push fixes to it, then rapid land --pr again)"
+  [ -z "$mentions" ] || body="$body
+Notify:$mentions"
+  body="$body
+
+<!-- rejection pr=$n reviewer=$who branch=$branch at=$at -->"
+  if $dry; then
+    rapid_info "dry run: would close PR #$n on $repo, keeping $branch, with:"; sed 's/^/  | /' <<<"$body"; return 0
+  fi
+  gh pr close "$n" --repo "$repo" --comment "$body" >/dev/null || rapid_die "closing PR #$n on $repo failed; nothing changed"
+  rapid_info "PR #$n on $repo is rejected; $branch and its safety anchor are kept"
 }
 
 # A clone that never ran rapid setup has no hooks and maybe no dev: the verbs

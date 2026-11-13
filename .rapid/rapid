@@ -10,6 +10,8 @@
 #                                      its requirement and its test (later: a [MODE] change of .rapid/conf)
 #   rapid setup --install                link rapid into a bin directory of PATH (~/.local/bin),
 #                                      from wherever this copy stands; nothing is copied
+#   rapid setup --remote [--repo OWNER/REPO] [--dry-run]
+#                                      apply the forge rulesets and write the rapid-check workflow (gh)
 #   rapid branch <kind> <name> [-r TEXT] [--test PATH] [--ticket ID]
 #                                      start pool/v<series>/n<N>.<kind>.<name> at dev (n<N>: its number, creation
 #                                      ordered, never shared, online or offline); .rapid/requirements/<name>.md is
@@ -222,6 +224,7 @@ _setup_install() {
 
 cmd_setup() {
   case "${1:-}" in
+    --remote) shift; _setup_remote "$@"; return ;;
     --install) shift; _setup_install "$@"; return ;;
     --owner|--owner-name|--require-test|--pin) _setup_owner_args "$@" ;;
     "") ;;
@@ -315,6 +318,91 @@ cmd_setup() {
       git push -q --atomic origin $need $tags || rapid_die "origin refused the push; nothing was published"
       rapid_info "seeded origin with:$need${tags:+ plus the tags on dev}"
     fi
+  fi
+}
+
+# _setup_remote [--repo OWNER/REPO] [--dry-run]: the forge side, through gh.
+# Each .rapid/remote/*.json ruleset is created, or updated in place when a
+# ruleset of that name exists; check.yml is written to
+# .github/workflows/rapid-check.yml for a branch to commit. The rulesets refuse
+# deleting or rewriting dev and main and moving or deleting a
+# version or release tag; rapid-main also refuses any update of main, and
+# rapid-release-tags any new release/* tag, except by the repository's admins
+# (main is production: only the owner promotes); with land_pr=required the
+# dev-only rapid-review ruleset also takes GitHub's review rule and the
+# rapid-check status (_render_ruleset), so review never lands on main, where it
+# would refuse the owner's release push. Landing stays a push with the
+# lander's credentials, of the approved PR head under review.
+_setup_remote() {
+  local repo="" dry=false root url f name id wf
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:-}"; shift 2 ;;
+      --dry-run) dry=true; shift ;;
+      *) RAPID_RC=2 rapid_die "setup --remote: unknown argument $1" ;;
+    esac
+  done
+  root=$(rapid_root); cd "$root"
+  if [ -z "$repo" ]; then
+    url=$(git remote get-url origin 2>/dev/null) || RAPID_RC=2 rapid_die "setup --remote: no origin; pass --repo OWNER/REPO"
+    repo=$(sed -nE 's#^(https://[^/]+/|git@[^:]+:|ssh://git@[^/]+/)([^/]+/[^/]+)$#\2#p' <<<"$url" | sed -E 's/\.git$//')
+  fi
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || RAPID_RC=2 rapid_die "setup --remote: cannot tell OWNER/REPO from '$(sed -E 's#^([a-z+]+://)[^/@]*@#\1#' <<<"${url:-$repo}")'; pass --repo"
+  command -v gh >/dev/null 2>&1 || rapid_die "setup --remote needs the gh CLI, signed in with admin rights on $repo"
+  local rendered; rendered=$(rapid_tmpdir rulesets)
+  for f in "$RAPID_SELF"/remote/*.json; do
+    _render_ruleset "$f" > "$rendered/$(basename "$f")"
+  done
+  for f in "$rendered"/*.json; do
+    name=$(sed -nE 's/^[[:space:]]*"name":[[:space:]]*"([^"]+)".*/\1/p' "$f" | sed -n 1p)
+    [ -n "$name" ] || rapid_die "$f has no name"
+    id=$(gh api "repos/$repo/rulesets" --jq ".[] | select(.name == \"$name\") | .id" 2>/dev/null | sed -n 1p || true)
+    if $dry; then
+      if [ -n "$id" ]; then rapid_info "dry run: would update ruleset $id $name on $repo"; else rapid_info "dry run: would create ruleset $name on $repo"; fi
+      continue
+    fi
+    if [ -n "$id" ]; then
+      gh api -X PUT "repos/$repo/rulesets/$id" --input "$f" >/dev/null || rapid_die "updating ruleset $name on $repo failed"
+      rapid_info "updated ruleset $name ($id) on $repo"
+    else
+      gh api -X POST "repos/$repo/rulesets" --input "$f" >/dev/null || rapid_die "creating ruleset $name on $repo failed (rulesets need admin rights and a plan that has them)"
+      rapid_info "created ruleset $name on $repo"
+    fi
+  done
+  rm -rf "$rendered"
+  wf=.github/workflows/rapid-check.yml
+  if [ -f "$wf" ] && cmp -s "$RAPID_SELF/remote/check.yml" "$wf"; then
+    rapid_info "$wf is current"
+  elif $dry; then
+    rapid_info "dry run: would write $wf"
+  else
+    mkdir -p .github/workflows; cp "$RAPID_SELF/remote/check.yml" "$wf"
+    rapid_info "wrote $wf; commit it on a branch and land it"
+  fi
+}
+
+# _render_ruleset FILE: the ruleset as applied. With land_pr=required on
+# dev, rapid-review (dev only, never main) also carries GitHub's own review rule
+# and the rapid-check status: dev moves only to the head of a pull request holding land_approvals
+# approvals given after its last push (stale approvals dismissed), and only
+# when rapid-check, run by dev's own checker, passed on that commit. The review
+# rule is the authority: a status can be produced by whatever workflow a
+# candidate carries, an approval only by a reviewer (land --pr).
+_render_ruleset() {
+  local f="$1" req n rules
+  req=$(RAPID_CONF_REV=dev rapid_conf land_pr optional 2>/dev/null || echo optional)
+  if [ "$req" = required ] && grep -q '"name": "rapid-review"' "$f"; then
+    n=$(RAPID_CONF_REV=dev rapid_conf land_approvals 1)
+    [[ "$n" =~ ^[0-9]{1,2}$ ]] && [ "$n" -le 10 ] || RAPID_RC=2 rapid_die "land_approvals='$n' must be 0 to 10 for the forge's review rule"
+    rules='"rules": [ { "type": "deletion" }, { "type": "non_fast_forward" }, '
+    rules="$rules"'{ "type": "required_status_checks", "parameters": { "strict_required_status_checks_policy": false, "required_status_checks": [ { "context": "rapid-check" }, { "context": "commit-audit" } ] } }, '
+    # the last push needs someone else's approval whenever an approval is required at all; with
+    # land_approvals=0 there is no approval to give, and GitHub would refuse every merge (live canary C7)
+    local lpa=true; [ "$n" -ge 1 ] || lpa=false
+    rules="$rules"'{ "type": "pull_request", "parameters": { "required_approving_review_count": '"$n"', "dismiss_stale_reviews_on_push": true, "require_last_push_approval": '"$lpa"', "require_code_owner_review": false, "required_review_thread_resolution": false } } ]'
+    sed -E "s#\"rules\": \[ \{ \"type\": \"deletion\" \}, \{ \"type\": \"non_fast_forward\" \} \]#$rules#" "$f"
+  else
+    cat "$f"
   fi
 }
 

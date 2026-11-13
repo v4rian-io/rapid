@@ -8,6 +8,8 @@
 #                                      (NAME: the owner's name, beside the address)
 #   rapid setup --require-test          the first setup writes requirement_test=required: every branch states
 #                                      its requirement and its test (later: a [MODE] change of .rapid/conf)
+#   rapid setup --install                link rapid into a bin directory of PATH (~/.local/bin),
+#                                      from wherever this copy stands; nothing is copied
 #   rapid branch <kind> <name> [-r TEXT] [--test PATH] [--ticket ID]
 #                                      start pool/v<series>/n<N>.<kind>.<name> at dev (n<N>: its number, creation
 #                                      ordered, never shared, online or offline); .rapid/requirements/<name>.md is
@@ -181,8 +183,38 @@ _setup_owner_write() {
   rapid_info "admin: $e, named by --owner (the admins flip policy in [MODE] commits and promote dev to main)"
 }
 
+# _setup_install: rapid setup --install. Links this copy of rapid, wherever it stands, into a
+# bin directory of the user that PATH names ($HOME/.local/bin): one link, no
+# copy. Run again it changes nothing; a link to another rapid is replaced, any other file at
+# that path stays and the install is refused.
+_setup_install() {
+  [ $# = 0 ] || RAPID_RC=2 rapid_die "setup --install takes no argument, got $1"
+  local self bin="" d link cur
+  self="$(cd "$RAPID_SELF" && pwd -P)/rapid"
+  # this clone's own state (backup zips, kept versions) is no part of its tree
+  for d in "$HOME/.local/bin"; do
+    case ":$PATH:" in *":$d:"*) bin="$d"; break ;; esac
+  done
+  [ -n "$bin" ] || rapid_die "setup --install: $HOME/.local/bin is not on PATH; add this line to your shell profile, open a new shell, then run it again: export PATH=\"\$HOME/.local/bin:\$PATH\""
+  link="$bin/rapid"
+  if [ -L "$link" ]; then
+    cur=$(readlink "$link")
+    if [ "$cur" = "$self" ]; then rapid_info "rapid is linked: $link -> $self"; return 0; fi
+    case "$cur" in
+      */.rapid/rapid) rm -f "$link" ;;
+      *) rapid_die "setup --install: $link is a link to $cur, not to a rapid; nothing was changed" ;;
+    esac
+  elif [ -e "$link" ]; then
+    rapid_die "setup --install: $link exists, it is no link to a rapid; nothing was changed"
+  fi
+  mkdir -p "$bin"
+  ln -s "$self" "$link"
+  rapid_info "linked $link -> $self"
+}
+
 cmd_setup() {
   case "${1:-}" in
+    --install) shift; _setup_install "$@"; return ;;
     --owner|--owner-name|--require-test|--pin) _setup_owner_args "$@" ;;
     "") ;;
     *) RAPID_RC=2 rapid_die "setup: unknown argument $1" ;;

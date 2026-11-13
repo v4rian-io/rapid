@@ -1165,3 +1165,604 @@ def check_deletion(targets, ctx, env, envprefix, xargs, words):
         if p is None or not is_tmp(p, narrowed=False):
             deny(msg)
 
+
+# --------------------------------------------------------------------------- git
+GIT_GLOBAL_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix",
+                       "--config-env", "--list-cmds"}
+# Config keys whose value git runs as a command (re-audit H7), and the values that run nothing.
+GIT_CMD_KEYS = re.compile(r"^(core\.(pager|fsmonitor|sshcommand|editor|askpass|gitproxy|alternaterefscommand)|pager\..+|"
+                          r"alias\..+|credential\.(.+\.)?helper|diff\.external|diff\..+\.(command|textconv)|"
+                          r"merge\..+\.driver|filter\..+\.(clean|smudge|process)|sequence\.editor|gpg\.(.+\.)?program|"
+                          r"uploadpack\.packobjectshook|remote\..+\.(uploadpack|receivepack|vcs)|core\.hookspath|"
+                          r"include\.path|includeif\..+\.path)$", re.I)
+GIT_CMD_ENV = {"GIT_PAGER", "PAGER", "GIT_SSH_COMMAND", "GIT_SSH", "GIT_EXTERNAL_DIFF", "GIT_EDITOR", "EDITOR", "VISUAL",
+               "GIT_SEQUENCE_EDITOR", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_CONFIG_PARAMETERS", "GIT_PROXY_COMMAND"}
+SAFE_CMD_VALUES = {"", "true", ":", "cat", "less", "less -R", "more", "false", "/dev/null", "vi", "vim", "nano"}
+# Long options git accepts by unique prefix (re-audit H3), dangerous first.
+GIT_LONG = ["--force", "--force-with-lease", "--force-if-includes", "--hard", "--delete", "--prune", "--mirror", "--all",
+            "--discard-changes", "--move", "--remove", "--merge", "--keep", "--soft", "--mixed", "--amend",
+            "--no-verify", "--tags", "--follow-tags", "--set-upstream", "--dry-run", "--staged", "--worktree", "--update",
+            "--file", "--interactive", "--output", "--upload-pack", "--receive-pack", "--exec", "--rebase", "--author"]
+# Single-letter options that take a value, per subcommand: a cluster stops at them (round 2 H2).
+GIT_CLUSTER_ARGS = {"push": "o", "branch": "u", "checkout": "bB", "switch": "cC", "reset": "", "clean": "e",
+                    "tag": "mFuS", "rm": "", "restore": "s", "stash": "m", "worktree": "b", "commit": "mFcCt",
+                    "fetch": "", "pull": "", "clone": "bcou", "merge": "mFsX", "rebase": "sXx"}
+GIT_RISKY_SUBS = {"push", "reset", "clean", "branch", "checkout", "switch", "restore", "rebase", "tag", "update-ref",
+                  "filter-branch", "filter-repo", "stash", "worktree", "gc", "prune", "reflog", "rm", "config", "symbolic-ref"}
+
+
+def _git_long(a):
+    """--forc -> --force, --h -> --hard: git takes any unambiguous prefix, however short; an
+    ambiguous one resolves to the most dangerous candidate here, the safe reading for the guard."""
+    if not a.startswith("--") or a == "--":
+        return a
+    name, eq, val = a.partition("=")
+    if name in GIT_LONG:
+        return a
+    cands = [k for k in GIT_LONG if k.startswith(name)]
+    return (cands[0] + eq + val) if cands else a
+
+
+def _expand_clusters(sargs, argletters):
+    """-fu -> -f -u, -Df -> -D -f; a letter that takes a value ends the cluster (-mfoo -> -m foo)."""
+    out, seen_dd = [], False
+    for a in sargs:
+        if seen_dd or a == "--":
+            seen_dd = True
+            out.append(a)
+            continue
+        if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]+", a):
+            body = a[1:]
+            for k, ch in enumerate(body):
+                out.append("-" + ch)
+                if ch in argletters:
+                    if body[k + 1:]:
+                        out.append(body[k + 1:])
+                    break
+            continue
+        out.append(a)
+    return out
+
+
+def _git_worktree_of(gd):
+    """The worktree git uses for --git-dir/GIT_DIR=gd with no work tree given (round 2 H4):
+    core.worktree, or the directory holding a .git dir, or the worktree a linked gitdir names.
+    None when it cannot be known (bare, or a plain directory whose work tree is the cwd)."""
+    if not os.path.isdir(gd):
+        return None
+    wt = git("--git-dir", gd, "config", "--get", "core.worktree", cwd="/")
+    if wt:
+        return os.path.normpath(os.path.join(gd, wt))
+    if os.path.basename(gd.rstrip("/")) == ".git":
+        return os.path.dirname(gd.rstrip("/"))
+    link = os.path.join(gd, "gitdir")
+    if os.path.isfile(link):
+        try:
+            target = open(link).read().strip()
+            return os.path.dirname(os.path.normpath(os.path.join(gd, target)))
+        except OSError:
+            return None
+    return None
+
+
+def _cmd_value_ok(v):
+    return v.strip() in SAFE_CMD_VALUES
+
+
+def check_git(args, env, envprefix, ctx, words):
+    raw = " ".join(w.raw for w in words)
+    gdir = ctx.cwd
+    git_dir = env.get("GIT_DIR")
+    for k, v in env.items():
+        if k in GIT_CMD_ENV and not _cmd_value_ok(v):
+            deny("%s=%s runs a command inside git (rapid guard): the guard cannot check it. Offending: %s" % (k, v, raw))
+    # GIT_CONFIG_COUNT/KEY_n/VALUE_n set config like git -c
+    for k, v in env.items():
+        m = re.fullmatch(r"GIT_CONFIG_KEY_([0-9]+)", k)
+        if m and GIT_CMD_KEYS.match(v) and not _cmd_value_ok(env.get("GIT_CONFIG_VALUE_" + m.group(1), "")):
+            deny("GIT_CONFIG_KEY_%s=%s runs a command inside git (rapid guard). Offending: %s" % (m.group(1), v, raw))
+        if m:
+            _check_disarm(v, env.get("GIT_CONFIG_VALUE_" + m.group(1), ""), raw)
+    if "GIT_ALLOW_PROTOCOL" in env and "ext" in env["GIT_ALLOW_PROTOCOL"].split(":"):
+        deny("GIT_ALLOW_PROTOCOL with ext lets a URL run a command (rapid guard). Offending: %s" % raw)
+    cfg = {}
+    i = 0
+    while i < len(args):
+        t = args[i].text
+        if not t.startswith("-") or t == "-":
+            break
+        key, val = t, None
+        if "=" in t and t.split("=", 1)[0] in GIT_GLOBAL_WITH_ARG:
+            key, val = t.split("=", 1)
+            i += 1
+        elif t in GIT_GLOBAL_WITH_ARG:
+            val = args[i + 1].text if i + 1 < len(args) else None
+            if i + 1 < len(args) and args[i + 1].dynamic:
+                val = None
+                gdir = None
+            i += 2
+        else:
+            i += 1
+        if key == "-C" and gdir is not None:
+            if val is None:
+                gdir = None
+            else:
+                p = expand(args[i - 1], gdir, env) if not val.startswith("/") else os.path.normpath(val)
+                gdir = p
+        elif key == "-c" and val is not None:
+            ck, _, cv = val.partition("=")
+            cfg[ck.lower()] = None if (args[i - 1].dynamic or "$" in cv) else cv
+            _check_disarm(ck, cv, raw)
+            if GIT_CMD_KEYS.match(ck) and not _cmd_value_ok(cv):
+                deny("git -c %s runs a command or hides one inside git (rapid guard): the guard cannot check it. Run the "
+                     "command directly. Offending: %s" % (ck, raw))
+        elif key == "--git-dir":
+            git_dir = val
+            if val is None:
+                gdir = None
+        elif key == "--work-tree":
+            gdir = os.path.normpath(os.path.join(gdir or "/", val)) if val else None
+    # --git-dir / GIT_DIR / GIT_WORK_TREE name the repository acted on, not the cwd (re-audit H5).
+    wt = env.get("GIT_WORK_TREE")
+    if wt is not None:
+        gdir = os.path.normpath(os.path.join(ctx.cwd or "/", wt)) if "$" not in wt else None
+    elif git_dir is not None:
+        if "$" in git_dir:
+            gdir = None
+        else:
+            gd = os.path.normpath(os.path.join(ctx.cwd or "/", git_dir))
+            # git acts on gd's refs; its work tree is never looked up from the cwd here
+            # (that answered the cwd's repository; round 2 H4).
+            gdir = _git_worktree_of(gd)
+    rest = args[i:]
+    if not rest:
+        return
+    sub = rest[0].text
+    if rest[0].dynamic or "$" in sub:
+        deny("A git subcommand computed at run time blocked (rapid guard). Offending: %s" % raw)
+    # Arguments computed at run time ($VAR, $(...), `...`) can name main or --hard; the guard
+    # compares literals, so a risky subcommand with one is refused (re-audit H2).
+    # send-pack is push without the pre-push hook: the push rules check it
+    if sub == "send-pack":
+        sub = "push"
+    if sub in GIT_RISKY_SUBS and any(w.dynamic or "$" in w.text or "`" in w.text for w in rest[1:]):
+        deny("git %s with an argument computed at run time blocked (rapid guard): write the value out. Offending: %s"
+             % (sub, raw))
+    sargs = [_git_long(w.text) for w in rest[1:]]
+    if sub in GIT_CLUSTER_ARGS:
+        sargs = _expand_clusters(sargs, GIT_CLUSTER_ARGS[sub])
+    if sub == "config":
+        pos = [a for a in sargs if not a.startswith("-")]
+        if len(pos) >= 2 and GIT_CMD_KEYS.match(pos[0]) and not _cmd_value_ok(" ".join(pos[1:])):
+            deny("git config %s sets a command git will run (rapid guard): the guard cannot check it later. Offending: %s"
+                 % (pos[0], raw))
+        if len(pos) >= 2:
+            _check_disarm(pos[0], " ".join(pos[1:]), raw)
+        # listing config prints the tokens it holds (extraheader, credential URLs; round 2 M6)
+        opts = [a for a in sargs if a.startswith("-")]
+        if any(o in ("-l", "--list") for o in opts) or (any(o == "--get-regexp" for o in opts) and pos and
+                re.search(pos[0], "http.https://github.com/.extraheader remote.origin.url credential.helper", re.I)):
+            deny("Listing git config blocked (rapid guard, rule 4): it can print tokens (http.extraheader, credential "
+                 "URLs). Ask for the one key you need with git config --get. Offending: %s" % raw)
+    if sub == "credential" and sargs[:1] and sargs[0] in ("fill", "get"):
+        deny("git credential fill prints a stored credential (rapid guard, rule 4). Offending: %s" % raw)
+    # transport programs run as commands (round 2 M1)
+    for j, a in enumerate(sargs):
+        name_, _, val_ = a.partition("=")
+        if sub in ("fetch", "pull", "clone", "ls-remote", "archive", "push", "submodule") and \
+                name_ in ("--upload-pack", "--receive-pack", "--exec") or (sub in ("fetch", "clone", "ls-remote") and a == "-u"):
+            v = val_ if "=" in a else (sargs[j + 1] if j + 1 < len(sargs) else "")
+            if v and not re.fullmatch(r"(/[\w./-]+/)?git[- ](upload|receive)-pack|git-upload-archive", v):
+                deny("%s runs %s as a program (rapid guard): the guard cannot check it. Offending: %s" % (name_, v, raw))
+        if "ext::" in a or a.startswith("fd::"):
+            deny("An ext:: or fd:: URL runs a command (rapid guard). Offending: %s" % raw)
+    # --output writes to any path (round 2 L3)
+    for j, a in enumerate(sargs):
+        if a == "--output" or a.startswith("--output="):
+            v = a.split("=", 1)[1] if "=" in a else (sargs[j + 1] if j + 1 < len(sargs) else "")
+            _check_clobber([Word(v, "$" in v, v)], ctx, env, "git --output")
+    # a hook git cannot execute is a hook git skips: no mode change inside a protected .rapid
+    if sub == "update-index" and any(a.startswith("--chmod") for a in sargs):
+        for a in _pos(sargs):
+            p = a if a.startswith("/") else os.path.join(gdir or ctx.cwd or "/", a)
+            if protected(p):
+                deny(PROTECTED_MSG % p)
+    temp_repo = bool(gdir) and is_tmp(gdir)
+    # hooks are the protocol's gates: an agent never skips them in a real repo (round 2 L5)
+    if not temp_repo and sub in ("commit", "push", "merge") and any(a == "--no-verify" or (sub == "commit" and a == "-n")
+                                                                     for a in _opts(sargs)):
+        deny("git %s --no-verify blocked (rapid guard): the hooks are the protocol's gates. Fix what they refuse. "
+             "Offending: %s" % (sub, raw))
+    # rapid's commit checks are git's hooks where rapid setup put them: an agent never points git elsewhere or unsets
+    # it, for one command (-c, GIT_CONFIG_KEY_n) or for good (git config) (audit 4 L2)
+    if not temp_repo:
+        _check_hookspath(sub, sargs, cfg, env, gdir, raw)
+    # a version tag names the merge rapid land made; an agent never moves one (audit 4 L2)
+    if not temp_repo and (
+            (sub == "tag" and any(o in ("-f", "--force") or re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", o) for o in _opts(sargs))
+             and any(VERSION_TAG_RE.fullmatch(a) for a in _pos(sargs))) or
+            (sub == "update-ref" and not any(a in ("-d", "--stdin") for a in sargs)
+             and any(VERSION_TAG_RE.fullmatch(a) and a.startswith("refs/tags/") for a in _pos(sargs)[:1]))):
+        deny("Moving a version tag blocked (rapid guard): v<year>.<n>.<n> names the merge rapid land made and never moves. "
+             "Offending: %s" % raw)
+    # the close note says "this clone ran the gates on this merge"; only rapid land writes it (round 3 L9)
+    if not temp_repo and any("rapid-close" in a for a in sargs) and (
+            sub == "update-ref" or (sub == "notes" and any(a in ("add", "append", "copy", "edit", "merge", "remove", "prune")
+                                                            for a in _pos(sargs)))):
+        deny("Writing the rapid-close note blocked (rapid guard): rapid land writes it after the gates pass; a hand-written "
+             "note would skip pre-push's gate rerun. Offending: %s" % raw)
+    # the gate log archive (refs/notes/gates) is written by rapid land only and never rewritten or deleted
+    gates_ref = any(re.search(r"(^|[=/\s])(refs/notes/)?gates$", a) or a in ("--ref=gates", "--ref=refs/notes/gates")
+                    for a in sargs) or any(sargs[j] == "--ref" and j + 1 < len(sargs) and sargs[j + 1] in ("gates", "refs/notes/gates")
+                                           for j in range(len(sargs)))
+    if not temp_repo and gates_ref and (
+            sub == "update-ref" or (sub == "notes" and any(a in ("add", "append", "copy", "edit", "merge", "remove", "prune")
+                                                            for a in _pos(sargs)))):
+        deny("Writing the gate log notes blocked (rapid guard): refs/notes/gates is the durable gate log rapid land writes "
+             "after the gates run; it is never written, rewritten or deleted by hand. Offending: %s" % raw)
+    if not temp_repo and sub == "push" and any(re.search(r"(^\+|^:|\+.*:)?refs/notes/gates", a) and (a.startswith(":") or a.startswith("+"))
+                                               for a in sargs):
+        deny("Deleting or force-pushing refs/notes/gates blocked (rapid guard): the gate log archive only grows. Offending: %s" % raw)
+    # safety anchors stay forever (owner rule): never deleted, moved or forged, preflight or not
+    if not temp_repo:
+        check_anchor(sub, sargs, raw)
+        check_branch_delete(sub, sargs, raw)
+    # a release/<v> tag is the owner's release (it opens the next series even without main): an agent
+    # never makes, writes or pushes one, in any repository
+    if (sub == "tag" and not any(a in ("-d", "--delete", "-l", "--list", "-v", "--verify") for a in _opts(sargs))
+            and any(re.fullmatch(r"(refs/tags/)?release/.+", a) for a in sargs)) or \
+            (sub == "update-ref" and any(a.startswith("refs/tags/release/") for a in sargs)) or \
+            (sub == "push" and any(re.search(r"(^|:|\+|refs/tags/)release/", a) for a in sargs)):
+        deny(RELEASE_TAG_MSG % raw)
+    if sub == "interpret-trailers" and re.search(r"co-authored-by:?\s*.*claude", re.sub(r"['\"]", "", " ".join(sargs)), re.I):
+        deny("Co-Authored-By: Claude trailer blocked (rapid protocol, .rapid/hooks/commit-msg). Offending: %s" % raw)
+
+    if sub == "commit":
+        ctx.has_commit = True
+        flat = re.sub(r"['\"\\]", "", ctx.raw)
+        if re.search(r"co-authored-by:\s*claude", flat, re.I) or any(re.search(r"co-authored-by:\s*claude", re.sub(r"['\"]", "", a), re.I) for a in sargs):
+            deny("Co-Authored-By: Claude trailer blocked (rapid protocol, .rapid/hooks/commit-msg): commit without the trailer.")
+        for j, a in enumerate(sargs):
+            if a in ("-F", "--file") and j + 1 < len(sargs) or a.startswith("--file="):
+                fp = sargs[j + 1] if a in ("-F", "--file") else a.split("=", 1)[1]
+                full = fp if fp.startswith("/") else os.path.join(gdir or "/", fp)
+                try:
+                    if re.search(r"co-authored-by:\s*claude", open(full, errors="replace").read(), re.I):
+                        deny("Co-Authored-By: Claude trailer blocked (rapid protocol, .rapid/hooks/commit-msg): commit without the trailer.")
+                except OSError:
+                    pass
+        if any(re.fullmatch(r"-[a-zA-Z]*a[a-zA-Z]*", a) and not a.startswith("--") for a in _opts(sargs)) or "--all" in _opts(sargs):
+            deny("git commit -a blocked (rapid protocol): stage files by name, then commit. Offending: %s" % raw)
+
+    if sub in ("add", "stage"):
+        opts, paths = _split_dashdash(sargs)
+        dry = any(o == "--dry-run" or re.fullmatch(r"-[A-Za-z]*n[A-Za-z]*", o) for o in opts)
+        if not dry:
+            if any(o in ("-A", "--all", "-u", "--update", "--no-ignore-removal") or re.fullmatch(r"-[A-Za-z]*[Au][A-Za-z]*", o)
+                   for o in opts) or any(p in (".", "./", ":/", ":", "*", ":(top)") for p in paths):
+                deny("git add -A / git add . blocked (rapid protocol): stage files by name. Offending: %s" % raw)
+        if any(BANNED_STAGE_RE.search(p) for p in paths):
+            deny("Staging a banned file blocked (rapid protocol: .DS_Store, .auth/, keys/, certificates, build/, "
+                 "node_modules/, .env, *.zip, *.bak). Offending: %s" % raw)
+
+
+    if sub == "filter-branch" and "--all" in sargs:
+        deny("git filter-branch -- --all blocked (rapid protocol). Offending: %s" % raw)
+
+    destructive = None
+    if sub == "push":
+        destructive = check_push(sargs, gdir, raw)
+    elif sub == "reset" and "--hard" in sargs:
+        destructive = "git reset --hard"
+    elif sub == "reset" and _reset_moves_back(sargs, gdir):
+        destructive = "history rewrite (reset moves the branch off its commits)"
+    elif sub == "commit" and "--amend" in sargs and _head_published(gdir):
+        destructive = "history rewrite (amend of a pushed commit)"
+    elif sub == "checkout" and (any(a in ("-f", "--force") for a in sargs) or "--" in sargs or "." in sargs
+                                or any(a.startswith(":") for a in _pos(sargs)) or _checkout_paths(sargs, gdir)):
+        destructive = "git checkout --force"
+    elif sub == "restore" and not ("--staged" in sargs and "--worktree" not in sargs and "-W" not in sargs):
+        destructive = "git restore"
+    elif sub == "switch" and any(a in ("-f", "--force", "--discard-changes") for a in sargs):
+        destructive = "git switch --discard-changes"
+    elif sub == "clean" and any(re.fullmatch(r"-[a-zA-Z]*[fi][a-zA-Z]*", a) or a in ("--force", "--interactive")
+                                for a in sargs):
+        destructive = "git clean -f"
+    elif sub == "branch" and (any(a in ("-D", "-M", "-C") for a in sargs) or
+                              (any(a in ("-d", "--delete", "-m", "--move") for a in sargs) and any(a in ("-f", "--force") for a in sargs))):
+        destructive = "git branch -D"
+    elif sub in ("rebase", "filter-branch", "filter-repo"):
+        destructive = "history rewrite (%s)" % sub
+    elif sub == "stash" and sargs[:1] and sargs[0] in ("drop", "clear"):
+        destructive = "git stash drop/clear"
+    elif (sub == "reflog" and sargs[:1] == ["expire"]) or (sub == "gc" and any(a.startswith("--prune") for a in sargs)) \
+            or (sub == "update-ref" and "-d" in sargs) or sub == "prune":
+        destructive = "ref/reflog pruning"
+    elif sub == "worktree" and sargs[:1] == ["remove"] and any(a in ("-f", "-ff", "--force") for a in sargs):
+        destructive = "git worktree remove --force"
+    elif sub == "tag" and any(a in ("-d", "--delete") for a in sargs):
+        destructive = "git tag -d"
+    # Forms that discard work or move an existing branch away from its
+    # commits, found after the v2026.0.194 re-audit.
+    elif sub == "read-tree" and any(a in ("-u",) for a in sargs) and any(a in ("--reset", "-m") for a in sargs):
+        destructive = "git read-tree -u (overwrites the working tree)"
+    elif sub == "checkout-index" and any(a in ("-f", "--force") or re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", a) for a in sargs):
+        destructive = "git checkout-index -f (overwrites the working tree)"
+    elif sub == "submodule" and sargs[:1] == ["deinit"] and any(a in ("-f", "--force") for a in sargs):
+        destructive = "git submodule deinit -f"
+    elif sub == "rm" and any(a in ("-f", "--force") or re.fullmatch(r"-[a-zA-Z]*f[a-zA-Z]*", a) for a in _opts(sargs)) \
+            and "--cached" not in sargs:
+        destructive = "git rm -f (drops uncommitted changes)"
+    elif sub == "branch" and any(a in ("-f", "--force") for a in sargs) and _moves_branch(sargs, ("-f", "--force"), gdir):
+        destructive = "git branch -f (moves an existing branch)"
+    elif sub in ("checkout", "switch") and _moves_branch(sargs, ("-B", "-C", "--force-create"), gdir):
+        destructive = "git %s -B/-C (resets an existing branch)" % sub
+    elif sub == "update-ref" and not any(a in ("-d", "--stdin") for a in sargs) and _pos(sargs)[:1] \
+            and _pos(sargs)[0].startswith("refs/heads/") and _branch_exists(_pos(sargs)[0], gdir):
+        destructive = "git update-ref (moves an existing branch)"
+    elif sub == "fetch" and any(re.match(r"^\+.*:(refs/heads/|[^/:]+$)", a) for a in _pos(sargs)):
+        destructive = "forced fetch into local branches"
+    elif sub == "pull" and any(a in ("-r", "--rebase") or a.startswith("--rebase=") and a != "--rebase=false" for a in sargs):
+        destructive = "history rewrite (pull --rebase)"
+    if not destructive:
+        return
+    require_preflight(destructive, gdir, git_dir, sargs, sub, ctx, raw)
+
+
+VERSION_TAG_RE = re.compile(r"(refs/tags/)?v[0-9]{4}\.[0-9]+\.[0-9]+")
+
+
+def _hookspath_ok(v, gdir):
+    """True when V points git's hooks where rapid setup puts them: the hook stubs under the git common
+    dir (<git common dir>/rapid/hooks) or, in the framework's own repository (it holds .rapid/rapid),
+    its .rapid/hooks."""
+    if v is None:
+        return False
+    v = v.strip()
+    top = (git("rev-parse", "--show-toplevel", cwd=gdir) or gdir) if gdir else None
+    own = bool(top) and os.path.isfile(os.path.join(top, ".rapid/rapid"))
+    if v in (".rapid/hooks", "./.rapid/hooks", ".rapid/hooks/"):
+        return own or not top
+    if not (top and v.startswith("/")):
+        return False
+    if own and os.path.normpath(v) == os.path.normpath(os.path.join(top, ".rapid/hooks")):
+        return True
+    common = git("rev-parse", "--git-common-dir", cwd=top)
+    if not common:
+        return False
+    common = common if common.startswith("/") else os.path.join(top, common)
+    return _real(v) == _real(os.path.join(common, "rapid/hooks"))
+
+
+def _check_hookspath(sub, sargs, cfg, env, gdir, raw):
+    msg = ("Moving git's hooks blocked (rapid guard): the hooks are rapid's commit and push checks; "
+           "rapid setup sets core.hooksPath and rapid doctor --fix repairs it. Offending: %s")
+    if "core.hookspath" in cfg and not _hookspath_ok(cfg["core.hookspath"], gdir):
+        deny(msg % raw)
+    for k, v in env.items():
+        m = re.fullmatch(r"GIT_CONFIG_KEY_([0-9]+)", k)
+        if m and v.lower() == "core.hookspath" and not _hookspath_ok(env.get("GIT_CONFIG_VALUE_" + m.group(1)), gdir):
+            deny(msg % raw)
+    if sub != "config":
+        return
+    opts, pos, skip = [], [], False
+    for a in sargs:
+        if skip:
+            skip = False
+        elif a.startswith("-"):
+            opts.append(a)
+            skip = a in ("-f", "--file", "--blob", "--type", "--default", "--comment", "--value", "--file-name")
+        else:
+            pos.append(a)
+    if pos[:1] and pos[0] in ("set", "unset", "get", "list", "edit", "rename-section", "remove-section"):
+        verb, pos = pos[0], pos[1:]
+    else:
+        verb = None
+    if not pos:
+        return
+    key = pos[0].lower()
+    removes = verb in ("unset", "rename-section", "remove-section") or \
+        any(o in ("--unset", "--unset-all", "--remove-section", "--rename-section") for o in opts)
+    if key == "core.hookspath" or (key == "core" and removes):
+        if removes or (len(pos) >= 2 and not _hookspath_ok(pos[1], gdir)):
+            deny(msg % raw)
+
+
+def _check_disarm(key, val, raw):
+    """-c keys that switch a safety off or let a URL run a program (round 2 M1, M2)."""
+    k, v = key.lower(), val.strip().lower()
+    if k == "clean.requireforce" and v in ("false", "no", "off", "0"):
+        deny("clean.requireForce=false disarms git clean's safety (rapid guard). Offending: %s" % raw)
+    if re.fullmatch(r"protocol\.(ext\.|fd\.)?allow", k) and v == "always" or k == "protocol.allow" and v == "always":
+        deny("%s=always lets a URL run a command (rapid guard). Offending: %s" % (key, raw))
+    if k in ("receive.denynonfastforwards", "receive.denydeletes") and v in ("false", "no", "off", "0"):
+        deny("%s=false disarms a server-side safety (rapid guard). Offending: %s" % (key, raw))
+
+
+def _reset_moves_back(sargs, gdir):
+    """git reset (soft, mixed, keep, merge) to a commit HEAD is not an ancestor of leaves the
+    branch's newer commits only in the reflog: a history rewrite like branch -f (round 2 M3).
+    Unstaging (reset, reset HEAD, reset -- paths) and moving forward are not."""
+    opts, pos = _split_dashdash(sargs)
+    if "--" in sargs:
+        pos = [a for a in sargs[:sargs.index("--")] if not a.startswith("-")]
+    if not pos or not gdir or not os.path.isdir(gdir):
+        return False
+    target = git("rev-parse", "--verify", "-q", pos[0] + "^{commit}", cwd=gdir)
+    head = git("rev-parse", "--verify", "-q", "HEAD", cwd=gdir)
+    if not target or not head or target == head:
+        return False
+    return subprocess.run(["git", "merge-base", "--is-ancestor", head, target], cwd=gdir,
+                          capture_output=True, timeout=8).returncode != 0
+
+
+def _head_published(gdir):
+    """HEAD is on a remote-tracking branch: amending it rewrites published history."""
+    if not gdir or not os.path.isdir(gdir):
+        return False
+    return bool(git("branch", "-r", "--contains", "HEAD", cwd=gdir))
+
+
+def _pos(sargs):
+    return [a for a in sargs if not a.startswith("-")]
+
+
+def _branch_exists(name, gdir):
+    ref = name if name.startswith("refs/") else "refs/heads/" + name
+    return bool(gdir and os.path.isdir(gdir) and git("rev-parse", "--verify", "-q", ref, cwd=gdir))
+
+
+def _moves_branch(sargs, flags, gdir):
+    """The branch named after one of FLAGS (or the first operand for branch -f) already exists."""
+    for j, a in enumerate(sargs):
+        if a in flags:
+            if a in ("-f", "--force"):
+                pos = _pos(sargs)
+                return bool(pos) and _branch_exists(pos[0], gdir)
+            return j + 1 < len(sargs) and _branch_exists(sargs[j + 1], gdir)
+    return False
+
+
+def _checkout_paths(sargs, gdir):
+    """git checkout <x> where x is no revision but an existing path discards its changes (re-audit M3)."""
+    if any(a in ("-b", "-B", "--orphan") for a in sargs) or not gdir or not os.path.isdir(gdir):
+        return False
+    for a in [a for a in sargs if not a.startswith("-")]:
+        if git("rev-parse", "--verify", "-q", a + "^{commit}", cwd=gdir):
+            continue
+        if os.path.exists(os.path.join(gdir, a)):
+            return True
+    return False
+
+
+def _opts(sargs):
+    return _split_dashdash(sargs)[0]
+
+
+def _split_dashdash(sargs):
+    if "--" in sargs:
+        k = sargs.index("--")
+        return [a for a in sargs[:k] if a.startswith("-")], [a for a in sargs[:k] if not a.startswith("-")] + sargs[k + 1:]
+    return [a for a in sargs if a.startswith("-")], [a for a in sargs if not a.startswith("-")]
+
+
+ANCHOR_RE = re.compile(r"^(\+)?([^:]*):?(.*)$")
+
+
+def check_anchor(sub, sargs, raw):
+    """safety/* (a branch's fork point) and vault/* (its landed tip) are written by rapid only, never deleted or moved."""
+    why = ("Safety anchors stay forever (rapid rule): the branch safety/v<series>/<name> keeps a branch's fork point for the "
+           "life of the repository, and vault/v<series>/<name> its landed tip; rapid writes them and nothing deletes, "
+           "moves or hand-writes them, with or without a "
+           "preflight. A branch never landed stays a branch. Offending: %s" % raw)
+    touches = [a for a in sargs if "safety/" in a or "vault/" in a]
+    if not touches:
+        return
+    if sub in ("update-ref", "symbolic-ref", "pack-refs", "replace"):
+        deny(why)
+    # git branch may list or inspect them, never create, move, rename or delete one by hand
+    if sub == "branch" and not any(a in ("--list", "-l", "-a", "--all", "-r", "--remotes", "--contains", "--no-contains",
+                                         "--merged", "--no-merged", "--points-at", "-v", "-vv", "--verbose", "--format",
+                                         "--show-current") or a.startswith("--format=") or a.startswith("--sort")
+                                   for a in sargs):
+        deny(why)
+    if sub == "push":
+        opts = [a for a in sargs if a.startswith("-")]
+        if any(o in ("-d", "--delete", "-f", "--force", "--prune", "--mirror") or o.startswith("--force-with-lease")
+               for o in opts):
+            deny(why)
+        for r in [a for a in sargs if not a.startswith("-")]:
+            m = ANCHOR_RE.match(r)
+            src, dst = m.group(2), (m.group(3) or m.group(2))
+            kept = any(k in dst for k in ("safety/", "vault/"))
+            if kept and (m.group(1) or src == "" or src != dst):
+                deny(why)
+    if sub == "fetch":
+        if any(a in ("-p", "--prune", "-f", "--force", "--prune-tags") for a in sargs) or \
+                any(a.startswith("+") and any(k in a.split(":", 1)[-1] for k in ("safety/", "vault/")) for a in sargs):
+            deny(why)
+
+
+KEPT_BRANCH_RE = re.compile(r"^(refs/heads/|heads/)?(dev|main|pool/.+|safety/.+|vault/.+)$")
+
+
+def check_branch_delete(sub, sargs, raw):
+    """Developers never delete branches: dev, main or a branch is never deleted or renamed by hand."""
+    why = ("Developers never delete branches (rapid rule): dev, main and branches are never deleted or renamed "
+           "by hand, with or without a preflight. Rename a branch with rapid branch --rename "
+           "<name>, and let rapid land delete a landed one. Offending: %s" % raw)
+    pos = [a for a in sargs if not a.startswith("-")]
+    opts = [a for a in sargs if a.startswith("-")]
+    if sub == "branch" and any(o in ("-d", "-D", "--delete", "-m", "-M", "--move") for o in opts):
+        if any(KEPT_BRANCH_RE.match(p) for p in pos):
+            deny(why)
+    if sub == "update-ref" and "-d" in opts and any(KEPT_BRANCH_RE.match(p) and p.startswith("refs/heads/") for p in pos):
+        deny(why)
+    if sub == "push":
+        delete = any(o in ("-d", "--delete") for o in opts)
+        for r in pos[1:]:
+            r = r.lstrip("+")
+            if r.startswith(":") and KEPT_BRANCH_RE.match(r[1:]):
+                deny(why)
+            if delete and KEPT_BRANCH_RE.match(r):
+                deny(why)
+
+
+def check_push(sargs, gdir, raw):
+    opts, pos, j = [], [], 0
+    while j < len(sargs):
+        a = sargs[j]
+        if a in ("-o", "--push-option", "--repo", "--receive-pack", "--exec"):
+            opts.append(a)
+            j += 2
+            continue
+        (opts if a.startswith("-") else pos).append(a)
+        j += 1
+    force = any(o in ("-f", "--force") for o in opts)
+    lease = any(o.startswith("--force-with-lease") for o in opts)
+    # Version tags are made only by rapid land (round 2 L6): an agent pushes no v<year>.<n>.<n>
+    # tag and no --tags / --follow-tags bulk tag push.
+    if any(o in ("--tags", "--follow-tags") for o in opts) or any(
+            re.search(r"(^|:|refs/tags/)v[0-9]{4}\.[0-9]+\.[0-9]+$", r.lstrip("+")) for r in pos[1:]):
+        deny("Pushing version tags blocked (rapid guard): v<year>.<n>.<n> tags come only from rapid land, which "
+             "pushes each with its merge. Offending: %s" % raw)
+    if force and not lease:
+        deny("Bare --force blocked (rapid protocol): use rapid sync --push. Offending: %s" % raw)
+    refspecs = pos[1:]
+    if any(o in ("--all", "--mirror") for o in opts):
+        deny("Push to main blocked: --all / --mirror would push main; push the named branch. Offending: %s" % raw)
+    if "--prune" in opts:
+        deny("git push --prune deletes remote branches (rapid guard); delete a branch by name after a preflight. "
+             "Offending: %s" % raw)
+    cur = git("symbolic-ref", "--short", "-q", "HEAD", cwd=gdir) if gdir and os.path.isdir(gdir) else None
+    plus = False
+    delete = any(o in ("-d", "--delete") for o in opts)
+    for r in refspecs:
+        if r.startswith("+"):
+            plus = True
+            r = r[1:]
+        dst = r.split(":", 1)[1] if ":" in r else r
+        if r.startswith(":"):
+            delete = True
+        if "*" in r:
+            deny("A wildcard refspec can push or overwrite main (rapid guard); push branches by name. Offending: %s" % raw)
+        if dst in ("HEAD", "@"):
+            dst = cur or "HEAD"
+            if cur is None:
+                deny("git push of HEAD with no branch checked out blocked (rapid guard): name the branch. Offending: %s" % raw)
+        if dst in ("main", "refs/heads/main"):
+            deny("Push to main blocked: main is production and advances only through rapid release, which the owner "
+                 "runs, never by a direct push. Offending: %s" % raw)
+    if plus and not lease:
+        deny("A +refspec is a bare force push (rapid protocol): use rapid sync --push. Offending: %s" % raw)
+    if not refspecs and gdir:
+        cur = git("symbolic-ref", "--short", "HEAD", cwd=gdir) if os.path.isdir(gdir) else None
+        if cur == "main":
+            deny("Push to main blocked: main is checked out in %s and a bare 'git push' would advance it. Switch to a "
+                 "branch; main is production and only the owner promotes it with rapid release." % gdir)
+    if lease or plus:
+        return "force push"
+    if delete:
+        return "remote branch deletion"
+    return None
+

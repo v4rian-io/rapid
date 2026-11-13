@@ -49,6 +49,7 @@
 #   rapid release [VERSION] [--dry-run] [--verbose]  release dev's tip: release gate, release/<v> tag, a release merge on main;
 #                                      main is production: only the owner promotes (release_who), never an agent;
 #                                      with release_build, the artifacts built on the tag, gated and listed in it
+#   rapid release --publish [VERSION]    ship a release's gated artifacts again (release_publish, the forge's release)
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
 #                                      I1 to I9, in full only after the last merge this clone verified (a note in
@@ -2039,6 +2040,7 @@ cmd_release() {
     esac
   done
   root=$(rapid_root); cd "$root"
+  if $publish; then _release_publish_again "$want"; return; fi
   [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit or stash them first"
   git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
   _sync_dev_from_origin
@@ -2095,11 +2097,16 @@ cmd_release() {
   local adir="" manifest="" gates="release=$g"
   if [ -n "$(rapid_conf release_build "")" ]; then
     adir="$(cd "$(git rev-parse --git-common-dir)" && pwd)/rapid-artifacts/$v"
+    if ! manifest=$(_release_artifacts "$wt" "$v" "$dev_tip" "$adir"); then
+      git worktree remove --force "$wt" >/dev/null 2>&1 || true
+      rapid_die "the release artifacts of $v are refused (above); main and tags are unchanged"
+    fi
     gates="$gates artifact=$(sed -n 's/^#gate //p' <<<"$manifest")"
     manifest=$(grep '^Artifact: ' <<<"$manifest")
   fi
   git worktree remove --force "$wt" >/dev/null 2>&1 || true
   # signed=required: the release tag is signed, and its signer must be one who may release (as pre-push and I5 check)
+  local sign=-a; ! rapid_release_signed "$main_old" "$dev_tip" || sign=-s
   if $dry && [ -n "$why" ]; then
     rapid_info "dry run: release gate on $v, but the release itself would be refused: $why"; [ -z "$manifest" ] || rm -rf "$adir"; return 0
   fi
@@ -2116,6 +2123,7 @@ Gates: $gates
 Tested-Tree: $(git rev-parse "$dev_tip^{tree}")
 Released-By: $ce${manifest:+
 $manifest}" "$dev_tip" || rapid_die "could not make the release tag$([ "$sign" = -s ] && echo ' (signed=required: git tag -s needs your signing key, user.signingkey)'); main and tags are unchanged"
+  why=$(rapid_release_sig_problem "refs/tags/release/$v" "$main_old" "$dev_tip")
   if [ -n "$why" ]; then git tag -d "release/$v" >/dev/null; rapid_die "policy: $why; main and tags are unchanged"; fi
   # main takes dev by a --no-ff release merge, so main's first-parent line is the list of releases
   local rmsg rmc
@@ -2127,8 +2135,10 @@ $manifest}" "$dev_tip" || rapid_die "could not make the release tag$([ "$sign" =
     printf '\nRelease: release/%s\nReleased-By: %s\n' "$v" "$ce"
   } > "$rmsg"
   local repo
+  repo=$(_release_forge)
   if [ -n "$repo" ]; then
     # main's ruleset requires a pull request: the forge writes the release merge, through a PR of dev
+    rmc=$(_release_pr_merge "$repo" "$v" "$main_old" "$dev_tip" "$rmsg") || { local prc=$?; rm -f "$rmsg"; git tag -d "release/$v" >/dev/null; exit "$prc"; }
     rm -f "$rmsg"
     if ! git push -q origin "refs/tags/release/$v"; then
       rapid_die "main took the release merge $(git rev-parse --short "$rmc") but the release tag push failed; rerun rapid release $v, which pushes the tag of a merged release"
@@ -2145,6 +2155,153 @@ $manifest}" "$dev_tip" || rapid_die "could not make the release tag$([ "$sign" =
   fi
   _move_branch main "$rmc" "$main_old"
   rapid_info "released $v (release gate $g): main at the release merge $(git rev-parse --short "$rmc") of dev $(git rev-parse --short "$dev_tip")$(rapid_has_remote && echo ', pushed'); the next land opens a new series"
+  [ -z "$manifest" ] || _release_publish "$v" "$adir" \
+    || rapid_warn "$v is released, but publishing its artifacts failed (above); rerun 'rapid release --publish $v'"
+}
+
+# _sha256 FILE: the file's SHA-256, hex.
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# _artifact_audit DIR: the no-debug audit of release integrity
+# gates, deterministic layer: debug build outputs (*.dSYM, *.pdb, *.debug, a
+# debug name segment), JavaScript source maps (*.map) and debugger;
+# statements in shipped JavaScript, also inside tarballs, whose payload is
+# what ships. One finding per line; empty output is clean.
+_artifact_audit() {
+  local d="$1" scan t f
+  scan=$(rapid_tmpdir audit); cp -R "$d/." "$scan/"
+  for t in $(find "$scan" -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.tar' \)); do
+    mkdir -p "$t.x"; tar -xf "$t" -C "$t.x" 2>/dev/null || echo "${t#$scan/}: cannot be unpacked for the audit"
+  done
+  find "$scan" \( -name '*.dSYM' -o -name '*.pdb' -o -name '*.debug' -o -name '*.map' \) | sed "s#^$scan/##; s#\.x/#: #; s#\$#: a debug build output or source map#"
+  find "$scan" -type f | sed "s#^$scan/##" | grep -iE '(^|/)[^/]*[-_.]debug([-_.][^/]*)?$' | grep -vE '\.debug$' | sed 's#\.x/#: #; s#$#: a debug build by name#' || true
+  for f in $(find "$scan" -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \)); do
+    grep -E '(^|[^A-Za-z0-9_])debugger[[:space:]]*;' "$f" >/dev/null && echo "${f#$scan/}: a debugger; statement" | sed 's#\.x/#: #'
+  done
+  rm -rf "$scan"
+  return 0
+}
+
+# _release_artifacts WT V DEV_TIP DIR: build the release artifacts on the
+# released tree in WT (release_build, with RAPID_VERSION, RAPID_SHA, RAPID_LABEL,
+# RAPID_ARTIFACTS=DIR and BUILD_TYPE=release), then gate them: at least one
+# file, each a plain file named with RAPID_LABEL (<version>-<sha>, so an
+# artifact names its one commit), the build left every tracked file as the
+# commit has it, the no-debug audit is clean and gates_artifact passes.
+# Prints "#gate <result>" and one "Artifact: <sha256> <name>" per file; the
+# reasons for a refusal go to stderr and the exit is 1.
+_release_artifacts() {
+  local wt="$1" v="$2" c="$3" d="$4" short label cmd rc=0 f n bad="" out ga
+  short=$(git rev-parse --short "$c"); label="$v-$short"
+  rm -rf "$d"; mkdir -p "$d"
+  [ -z "$(git -C "$wt" status --porcelain)" ] || { echo "X rapid: the release tree is not clean; a release artifact comes from exactly one commit" >&2; return 1; }
+  cmd=$(rapid_conf release_build "")
+  ( cd "$wt" && unset RAPID_CONF_REV RAPID_OFFLINE RAPID_RELAND_STEP \
+      && RAPID_VERSION="$v" RAPID_SHA="$short" RAPID_LABEL="$label" RAPID_ARTIFACTS="$d" BUILD_TYPE=release sh -c "$cmd" ) >"$d.log" 2>&1 || rc=$?
+  if [ "$rc" != 0 ]; then tail -n 25 "$d.log" | sed 's/^/    | /' >&2; rm -f "$d.log"; echo "X rapid: release_build fails on $v (exit $rc)" >&2; return 1; fi
+  rm -f "$d.log"
+  [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] \
+    || bad="${bad}the build changed tracked files ($(git -C "$wt" status --porcelain --untracked-files=no | awk '{print $2}' | tr '\n' ' ')); it writes only to RAPID_ARTIFACTS
+"
+  n=0
+  for f in "$d"/* "$d"/.[!.]*; do
+    [ -e "$f" ] || continue
+    n=$((n + 1))
+    if [ ! -f "$f" ] || [ -L "$f" ]; then bad="${bad}$(basename "$f") is not a plain file; an artifact is one file (pack a directory into a tarball)
+"; continue; fi
+    case "$(basename "$f")" in *"$label"*) ;; *) bad="${bad}$(basename "$f") is not labeled $label (name each artifact with \$RAPID_LABEL)
+" ;; esac
+  done
+  [ "$n" -ge 1 ] || bad="${bad}release_build wrote no artifact into RAPID_ARTIFACTS
+"
+  out=$(_artifact_audit "$d")
+  [ -z "$out" ] || bad="${bad}$out
+"
+  if [ -n "$bad" ]; then printf '%s' "$bad" | sed '/^$/d; s/^/  - /' >&2; return 1; fi
+  if ! ga=$(RAPID_VERSION="$v" RAPID_SHA="$short" RAPID_LABEL="$label" RAPID_ARTIFACTS="$d" rapid_gate artifact "$wt" ${RAPID_VERBOSE:+live}); then
+    echo "X rapid: gates_artifact fails on the artifacts of $v" >&2; return 1
+  fi
+  printf '#gate %s\n' "$ga"
+  for f in "$d"/*; do printf 'Artifact: %s %s\n' "$(_sha256 "$f")" "$(basename "$f")"; done
+}
+
+# _forge_repo_soft: OWNER/REPO of origin (or forge_repo), empty when neither names one.
+_forge_repo_soft() {
+  local r url
+  r=$(rapid_conf forge_repo "")
+  if [ -z "$r" ]; then
+    url=$(git remote get-url origin 2>/dev/null || true)
+    r=$(sed -nE 's#^(https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+)$#\2#p' <<<"$url" | sed -E 's/\.git$//')
+  fi
+  [[ "$r" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && printf '%s' "$r"
+  return 0
+}
+
+# _release_publish V DIR: ship release/V's gated artifacts, never a rebuild:
+# release_publish (the project's own channel) runs with RAPID_VERSION and
+# RAPID_ARTIFACTS, and on a forge the release object is created on release/V
+# with the artifacts attached and the tag's message (manifest included) as
+# its notes. Nonzero when a channel failed; the release itself stands.
+_release_publish() {
+  local v="$1" d="$2" cmd rc=0 repo notes f
+  cmd=$(rapid_conf release_publish "")
+  if [ -n "$cmd" ]; then
+    ( unset RAPID_CONF_REV RAPID_OFFLINE RAPID_RELAND_STEP; RAPID_VERSION="$v" RAPID_ARTIFACTS="$d" sh -c "$cmd" ) >&2 \
+      || { rapid_warn "release_publish failed for $v"; rc=1; }
+  fi
+  repo=$(_forge_repo_soft)
+  if [ -n "$repo" ] && command -v gh >/dev/null 2>&1; then
+    notes=$(mktemp "${TMPDIR:-/tmp}/rapid-notes.XXXXXX")
+    git for-each-ref --format='%(contents)' "refs/tags/release/$v" > "$notes"
+    if gh release view "release/$v" --repo "$repo" >/dev/null 2>&1; then
+      gh release upload "release/$v" "$d"/* --clobber --repo "$repo" >/dev/null || { rapid_warn "uploading the artifacts to the release object failed"; rc=1; }
+    else
+      gh release create "release/$v" "$d"/* --repo "$repo" --verify-tag --title "$v" --notes-file "$notes" >/dev/null \
+        || { rapid_warn "creating the release object release/$v on $repo failed"; rc=1; }
+    fi
+    rm -f "$notes"
+  fi
+  [ "$rc" = 0 ] && rapid_info "published the artifacts of $v: $(cd "$d" && ls | tr '\n' ' ')"
+  return "$rc"
+}
+
+# _release_publish_again [VERSION]: rapid release --publish. The owner reruns
+# the publication of a release (default: the last on dev) after a channel
+# failed. The artifacts kept from the release are checked against the
+# manifest in release/<version> first: what ships is what was gated.
+_release_publish_again() {
+  local v="${1:-}" d line sum name ce why n=0 f
+  if [ -z "$v" ]; then read -r v _ <<<"$(rapid_version_last dev)"; fi
+  [ "$v" != - ] || RAPID_RC=2 rapid_die "usage: rapid release --publish [VERSION] (dev carries no version yet, so there is no last release to publish again)"
+  git rev-parse -q --verify "refs/tags/release/$v" >/dev/null || rapid_die "release/$v does not exist; rapid release makes it"
+  ce=$(git var GIT_COMMITTER_IDENT 2>/dev/null | sed -nE 's/^.* <([^>]*)>.*$/\1/p') || ce=""
+  why=$(rapid_policy_may_release "$(git rev-parse main)" "$(git rev-parse "release/$v^{commit}")" "$ce") || rapid_die "policy: $why"
+  d="$(cd "$(git rev-parse --git-common-dir)" && pwd)/rapid-artifacts/$v"
+  [ -d "$d" ] || rapid_die "no artifacts of $v are kept in this clone ($d); they ship only from the clone that gated them"
+  while IFS= read -r line; do
+    sum=$(cut -d' ' -f2 <<<"$line"); name=$(cut -d' ' -f3- <<<"$line"); n=$((n + 1))
+    [ -f "$d/$name" ] && [ "$(_sha256 "$d/$name")" = "$sum" ] \
+      || rapid_die "$name does not match release/$v's manifest; a release ships its gated artifact, never another"
+  done <<<"$(git for-each-ref --format='%(contents)' "refs/tags/release/$v" | grep '^Artifact: ' || true)"
+  [ "$n" -ge 1 ] || rapid_die "release/$v lists no artifact; there is nothing to publish"
+  for f in "$d"/*; do
+    git for-each-ref --format='%(contents)' "refs/tags/release/$v" | grep -F " $(basename "$f")" >/dev/null \
+      || rapid_die "$(basename "$f") is not in release/$v's manifest"
+  done
+  _release_publish "$v" "$d" || rapid_die "publishing $v failed (above)"
+}
+
+# _release_forge: OWNER/REPO when origin is a forge whose main ruleset requires
+# a pull request (gh can tell), else empty: then the release merge is written
+# here and pushed.
+_release_forge() {
+  local r
+  rapid_has_remote && command -v gh >/dev/null 2>&1 || return 0
+  r=$(_forge_repo_soft); [ -n "$r" ] || return 0
+  if gh api "repos/$r/rules/branches/main" --jq '.[].type' 2>/dev/null | grep -x pull_request >/dev/null; then printf '%s' "$r"; fi
+  return 0
 }
 
 # _release_merge_ok M MAIN_OLD DEV_TIP V: 0 when M is the release merge of
@@ -2156,6 +2313,35 @@ _release_merge_ok() {
   [ "$(git rev-parse "$m^{tree}")" = "$(git rev-parse "$3^{tree}")" ] || { echo "  its tree is not dev's tree" >&2; ok=1; }
   [ "$(git log -1 --format=%s "$m")" = "[MERGE] dev into main: $4" ] || { echo "  its subject is not '[MERGE] dev into main: $4'" >&2; ok=1; }
   return "$ok"
+}
+
+# _release_pr_merge REPO V MAIN_OLD DEV_TIP MSGFILE: open or update the dev to
+# main PR with the release merge's subject and body, merge it through the
+# forge's API (merge_method=merge, sha=DEV_TIP, the exact title and message),
+# fetch main and print the merge after checking it is the release merge.
+# Exit 3 when the forge declines the merge (approvals or checks pending).
+_release_pr_merge() {
+  local repo="$1" v="$2" mo="$3" d="$4" msg="$5" n bodyf title m
+  title=$(sed -n 1p "$msg"); bodyf=$(mktemp "${TMPDIR:-/tmp}/rapid-relbody.XXXXXX"); sed '1,2d' "$msg" > "$bodyf"
+  n=$(gh pr list --repo "$repo" --base main --head dev --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+  if [ -z "$n" ]; then
+    gh pr create --repo "$repo" --base main --head dev --title "$title" --body-file "$bodyf" >/dev/null || { rm -f "$bodyf"; rapid_die "opening the dev to main PR failed"; }
+    n=$(gh pr list --repo "$repo" --base main --head dev --state open --json number --jq '.[0].number // empty')
+  else
+    gh pr edit "$n" --repo "$repo" --title "$title" --body-file "$bodyf" >/dev/null || { rm -f "$bodyf"; rapid_die "updating PR #$n failed"; }
+  fi
+  [ -n "$n" ] || { rm -f "$bodyf"; rapid_die "the forge did not report a dev to main PR number"; }
+  if ! gh api -X PUT "repos/$repo/pulls/$n/merge" -f merge_method=merge -f sha="$d" -f commit_title="$title" -f commit_message="$(cat "$bodyf")" >/dev/null; then
+    rm -f "$bodyf"
+    rapid_info "the forge declined to merge PR #$n into main yet (reviews or checks pending); run rapid release again once it is mergeable" >&2
+    return 3
+  fi
+  rm -f "$bodyf"
+  git fetch -q origin '+refs/heads/main:refs/remotes/origin/main' || rapid_die "fetching main after the merge failed; rerun rapid release"
+  m=$(git rev-parse refs/remotes/origin/main)
+  _release_merge_ok "$m" "$mo" "$d" "$v" \
+    || rapid_die "the forge merged PR #$n, but origin main $(git rev-parse --short "$m") is not the release merge (above); release/$v is not tagged. Tell the owner"
+  printf '%s' "$m"
 }
 
 # _release_tag_resume V DEV_TIP MAIN: a release whose merge is on main but

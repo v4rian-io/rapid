@@ -86,6 +86,7 @@ while read -r lref lsha rref rsha; do
             tagger=$(git for-each-ref --format='%(taggeremail)' "refs/tags/$t" | tr -d '<>')
             why=$(rapid_policy_may_release "$gov" "$c" "$tagger") \
               || fail "release tag $t was tagged by '${tagger:-<none>}': $why"
+            why=$(rapid_release_sig_problem "refs/tags/$t" "$gov" "$c"); [ -z "$why" ] || fail "release tag $why"
           fi ;;
       esac ;;
     refs/heads/dev|refs/heads/main)
@@ -149,6 +150,7 @@ while read -r lref lsha rref rsha; do
             tagger=$(git for-each-ref --format='%(taggeremail)' "refs/tags/release/$v" | tr -d '<>')
             why=$(rapid_policy_may_release "$gov" "$rc" "$tagger") \
               || fail "release/$v was tagged by '${tagger:-<none>}': $why"
+            why=$(rapid_release_sig_problem "refs/tags/release/$v" "$gov" "$rc"); [ -z "$why" ] || fail "release tag $why"
           done
         fi
       fi ;;

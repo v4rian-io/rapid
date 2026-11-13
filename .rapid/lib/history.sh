@@ -351,6 +351,7 @@ rapid_history_check() {
         tagger=$(git for-each-ref --format='%(taggeremail)' "$rt" | tr -d '<>')
         # a copy that names no admin (a CI checkout) leaves the owner to the forge, whose rulesets let only an admin release
         why=$(RAPID_ADMINS_NONE_OK=1 rapid_policy_may_release "$gov" "$c" "$tagger") || echo "I5 $c release/$v tagged by '${tagger:-<none>}': $why"
+        why=$(rapid_release_sig_problem "$rt" "$gov" "$c"); [ -z "$why" ] || echo "I5 $c $why"
       fi
     fi
     gov="$c"
@@ -543,6 +544,22 @@ rapid_ungated_range() {
   printf '%s' "${out# }"
 }
 
+# rapid_verify_release C: re-run the release gate the conf at C names on C's own
+# tree and compare with the release/<v> tag's Gates: test record; prints
+# "P1 <c> <why>" when a release that claims a pass cannot show one.
+rapid_verify_release() {
+  local c="$1" v test_record wt r
+  v=$(rapid_version_of "$c"); [ -n "$v" ] || return 0
+  git rev-parse -q --verify "refs/tags/release/$v" >/dev/null || return 0
+  test_record=$(git cat-file -p "refs/tags/release/$v" | sed -nE 's/^Gates: (.*)$/\1/p' | sed -n 1p)
+  wt=$(mktemp -d "${TMPDIR:-/tmp}/rapid-verify.XXXXXX")
+  git worktree add -q --detach "$wt" "$c" >/dev/null 2>&1 || { echo "P1 $c cannot check out the tree of release/$v"; return 0; }
+  r=$(RAPID_CONF_REV="$c" rapid_gate release "$wt" 2>/dev/null) || true
+  git worktree remove --force "$wt" >/dev/null 2>&1 || true
+  [ "$r" != fail ] || echo "P1 $c release gate fails on the tree of release/$v (its tag says ${test_record:-nothing})"
+  return 0
+}
+
 # rapid_verify_range SINCE DEV: rapid_verify_merge on each first-parent merge of DEV
 # after SINCE (SINCE empty or all zeros: every merge after the root), and
 # rapid_verify_release on each of them that a release/<v> tag names.
@@ -556,6 +573,7 @@ rapid_verify_range() {
     pn=$((pn + 1))
     [ -z "${rapid_live:-}" ] || printf 'doctor: verify: [%s/%s] %s\n' "$pn" "$pt" "$(_hv=$(rapid_version_of "$m"); [ -n "$_hv" ] || _hv=$(git rev-parse --short "$m"); printf %s "$_hv")" >&2
     rapid_verify_merge "$m" "fast full" "$dev"
+    rapid_verify_release "$m"
   done
 }
 

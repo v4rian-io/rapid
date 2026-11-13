@@ -37,6 +37,8 @@
 #   rapid check --merge REV              the forge's verification of a land --pr candidate (shape, gates, approvals);
 #                                      REV defaults to HEAD
 #   rapid check --review [--strict]       advisory Claude review of the branch's commits (nonce-bound verdicts)
+#   rapid check --land BRANCH...           every static land check of each branch (branch or name), all branches
+#                                      at once, every violation in one list; read-only
 #   rapid commit --smart [--message-only] opt-in: a fresh model context composes the message for the staged
 #                                      diff (claude -p, or conf smart_commit_cmd); the commit hooks check it
 #   rapid land [-F BODY] [--dry-run] [--failed-gates-only] [--verbose]
@@ -958,6 +960,7 @@ cmd_check() {
       --audit) shift; _check_audit_cmd "$@"; return ;;
       --reqs) shift; _check_reqs "$@"; return ;;
       --review) shift; _check_review "$@"; return ;;
+      --land) shift; _check_land "$@"; return ;;
       *) RAPID_RC=2 rapid_die "check: unknown argument $1" ;;
     esac
   done
@@ -972,6 +975,36 @@ cmd_check() {
   fi
   res=$(rapid_gate "$gate" "$root") || rapid_die "gate $gate: fail"
   rapid_info "gate $gate: $res"
+}
+
+# _check_land BRANCH...: rapid check --land. Every static land check of each
+# branch against local dev (_land_violations), all branches at once, one worker
+# each; the results print in the order named, every violation of a branch in
+# one block. BRANCH is a branch name or a branch name. Read-only; exit 1 when
+# any branch would be refused.
+_check_land() {
+  local root dev_tip d p b i=0 rc=0
+  [ $# -ge 1 ] || RAPID_RC=2 rapid_die "check --land names one branch or more (branch or name)"
+  root=$(rapid_root); cd "$root"
+  git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
+  dev_tip=$(git rev-parse dev); export RAPID_CONF_REV="$dev_tip"
+  d=$(rapid_tmpdir checkland)
+  for p in "$@"; do
+    i=$((i + 1)); b="${p#refs/heads/}"
+    git rev-parse -q --verify "refs/heads/$b" >/dev/null \
+      || b=$(_branch_ref "$p" || true)
+    printf '%s\n' "${b:-$p}" > "$d/$i.name"
+    ( _land_violations "${b:-$p}" "$dev_tip" > "$d/$i" 2>&1 ) &
+  done
+  wait
+  i=0
+  for p in "$@"; do
+    i=$((i + 1)); b=$(cat "$d/$i.name")
+    if [ -s "$d/$i" ]; then rc=1; printf 'X %s: %s reason(s)\n' "$b" "$(wc -l < "$d/$i" | tr -d ' ')"; sed 's/^/  - /' "$d/$i"
+    else printf 'ok %s may land\n' "$b"; fi
+  done
+  rm -rf "$d"
+  return "$rc"
 }
 
 # _check_audit_cmd [REV]: rapid check --audit. REV (default HEAD) a merge: its

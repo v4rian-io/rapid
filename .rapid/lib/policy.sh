@@ -411,4 +411,5 @@ rapid_flip_signer_problem() {
 # version tag, or is gone; else the one line that says what it must hold.
 rapid_pin_problem() {
   local p; p=$(sed -n 1p <<<"$1" | tr -d '[:space:]')
+  [ -z "$p" ] || rapid_pin_ok "$p" || echo ".rapid/version must hold one version tag (v<series>.<n>), not '$p'"
 }

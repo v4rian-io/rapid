@@ -2095,6 +2095,10 @@ cmd_release() {
   local adir="" manifest="" gates="release=$g"
   if [ -n "$(rapid_conf release_build "")" ]; then
     adir="$(cd "$(git rev-parse --git-common-dir)" && pwd)/rapid-artifacts/$v"
+    if ! manifest=$(_release_artifacts "$wt" "$v" "$dev_tip" "$adir"); then
+      git worktree remove --force "$wt" >/dev/null 2>&1 || true
+      rapid_die "the release artifacts of $v are refused (above); main and tags are unchanged"
+    fi
     gates="$gates artifact=$(sed -n 's/^#gate //p' <<<"$manifest")"
     manifest=$(grep '^Artifact: ' <<<"$manifest")
   fi
@@ -2145,6 +2149,74 @@ $manifest}" "$dev_tip" || rapid_die "could not make the release tag$([ "$sign" =
   fi
   _move_branch main "$rmc" "$main_old"
   rapid_info "released $v (release gate $g): main at the release merge $(git rev-parse --short "$rmc") of dev $(git rev-parse --short "$dev_tip")$(rapid_has_remote && echo ', pushed'); the next land opens a new series"
+}
+
+# _sha256 FILE: the file's SHA-256, hex.
+_sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+# _artifact_audit DIR: the no-debug audit of release integrity
+# gates, deterministic layer: debug build outputs (*.dSYM, *.pdb, *.debug, a
+# debug name segment), JavaScript source maps (*.map) and debugger;
+# statements in shipped JavaScript, also inside tarballs, whose payload is
+# what ships. One finding per line; empty output is clean.
+_artifact_audit() {
+  local d="$1" scan t f
+  scan=$(rapid_tmpdir audit); cp -R "$d/." "$scan/"
+  for t in $(find "$scan" -type f \( -name '*.tar.gz' -o -name '*.tgz' -o -name '*.tar' \)); do
+    mkdir -p "$t.x"; tar -xf "$t" -C "$t.x" 2>/dev/null || echo "${t#$scan/}: cannot be unpacked for the audit"
+  done
+  find "$scan" \( -name '*.dSYM' -o -name '*.pdb' -o -name '*.debug' -o -name '*.map' \) | sed "s#^$scan/##; s#\.x/#: #; s#\$#: a debug build output or source map#"
+  find "$scan" -type f | sed "s#^$scan/##" | grep -iE '(^|/)[^/]*[-_.]debug([-_.][^/]*)?$' | grep -vE '\.debug$' | sed 's#\.x/#: #; s#$#: a debug build by name#' || true
+  for f in $(find "$scan" -type f \( -name '*.js' -o -name '*.mjs' -o -name '*.cjs' \)); do
+    grep -E '(^|[^A-Za-z0-9_])debugger[[:space:]]*;' "$f" >/dev/null && echo "${f#$scan/}: a debugger; statement" | sed 's#\.x/#: #'
+  done
+  rm -rf "$scan"
+  return 0
+}
+
+# _release_artifacts WT V DEV_TIP DIR: build the release artifacts on the
+# released tree in WT (release_build, with RAPID_VERSION, RAPID_SHA, RAPID_LABEL,
+# RAPID_ARTIFACTS=DIR and BUILD_TYPE=release), then gate them: at least one
+# file, each a plain file named with RAPID_LABEL (<version>-<sha>, so an
+# artifact names its one commit), the build left every tracked file as the
+# commit has it, the no-debug audit is clean and gates_artifact passes.
+# Prints "#gate <result>" and one "Artifact: <sha256> <name>" per file; the
+# reasons for a refusal go to stderr and the exit is 1.
+_release_artifacts() {
+  local wt="$1" v="$2" c="$3" d="$4" short label cmd rc=0 f n bad="" out ga
+  short=$(git rev-parse --short "$c"); label="$v-$short"
+  rm -rf "$d"; mkdir -p "$d"
+  [ -z "$(git -C "$wt" status --porcelain)" ] || { echo "X rapid: the release tree is not clean; a release artifact comes from exactly one commit" >&2; return 1; }
+  cmd=$(rapid_conf release_build "")
+  ( cd "$wt" && unset RAPID_CONF_REV RAPID_OFFLINE RAPID_RELAND_STEP \
+      && RAPID_VERSION="$v" RAPID_SHA="$short" RAPID_LABEL="$label" RAPID_ARTIFACTS="$d" BUILD_TYPE=release sh -c "$cmd" ) >"$d.log" 2>&1 || rc=$?
+  if [ "$rc" != 0 ]; then tail -n 25 "$d.log" | sed 's/^/    | /' >&2; rm -f "$d.log"; echo "X rapid: release_build fails on $v (exit $rc)" >&2; return 1; fi
+  rm -f "$d.log"
+  [ -z "$(git -C "$wt" status --porcelain --untracked-files=no)" ] \
+    || bad="${bad}the build changed tracked files ($(git -C "$wt" status --porcelain --untracked-files=no | awk '{print $2}' | tr '\n' ' ')); it writes only to RAPID_ARTIFACTS
+"
+  n=0
+  for f in "$d"/* "$d"/.[!.]*; do
+    [ -e "$f" ] || continue
+    n=$((n + 1))
+    if [ ! -f "$f" ] || [ -L "$f" ]; then bad="${bad}$(basename "$f") is not a plain file; an artifact is one file (pack a directory into a tarball)
+"; continue; fi
+    case "$(basename "$f")" in *"$label"*) ;; *) bad="${bad}$(basename "$f") is not labeled $label (name each artifact with \$RAPID_LABEL)
+" ;; esac
+  done
+  [ "$n" -ge 1 ] || bad="${bad}release_build wrote no artifact into RAPID_ARTIFACTS
+"
+  out=$(_artifact_audit "$d")
+  [ -z "$out" ] || bad="${bad}$out
+"
+  if [ -n "$bad" ]; then printf '%s' "$bad" | sed '/^$/d; s/^/  - /' >&2; return 1; fi
+  if ! ga=$(RAPID_VERSION="$v" RAPID_SHA="$short" RAPID_LABEL="$label" RAPID_ARTIFACTS="$d" rapid_gate artifact "$wt" ${RAPID_VERBOSE:+live}); then
+    echo "X rapid: gates_artifact fails on the artifacts of $v" >&2; return 1
+  fi
+  printf '#gate %s\n' "$ga"
+  for f in "$d"/*; do printf 'Artifact: %s %s\n' "$(_sha256 "$f")" "$(basename "$f")"; done
 }
 
 # _release_merge_ok M MAIN_OLD DEV_TIP V: 0 when M is the release merge of

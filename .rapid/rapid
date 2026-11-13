@@ -83,6 +83,8 @@
 #   rapid doctor --verify [SINCE]         run again, on the own tree of each merge, what its test record names (after SINCE)
 #   rapid hook NAME [ARGS...]            run rapid's own hook NAME (commit-msg, pre-commit, pre-push, prepare-commit-msg)
 #                                      for this repository: what the hook stubs of an installed repository call
+#   rapid upgrade [VERSION]              on a branch: fetch the tags of the installed rapid and pin VERSION, by default
+#                                      the newest release, in .rapid/version when it is higher than the pin; commit, land
 #   rapid -h | --help
 #
 # kinds: feature fix r&d refactor docs test. names: a-z, 0-9 and -, 2 to 48 chars.
@@ -3078,6 +3080,46 @@ cmd_queue() {
   rm -rf "$d"
 }
 
+# ==== upgrade
+# ---------------------------------------------------------------- upgrade
+# _pin_num PIN: the version numbers of a pin (release/v2026.1.2 -> 2026 1 2).
+_pin_num() { printf '%s' "${1#release/}" | sed 's/^v//; s/[.]/ /g'; }
+
+# rapid upgrade [VERSION]: on a branch of an installed repository, fetch the tags of the clone the
+# pin resolves from, then write VERSION (by default the newest release tag it holds) into
+# .rapid/version when it is higher than the pin there. The branch then commits and lands it: it
+# lands under the version dev pins. rapid's own repository runs its own .rapid: nothing to pin.
+cmd_upgrade() {
+  local root clone cur want b a c
+  [ $# -le 1 ] || RAPID_RC=2 rapid_die "upgrade: unknown argument $2"
+  case "${1:-}" in -*) RAPID_RC=2 rapid_die "upgrade: unknown argument $1" ;; esac
+  root=$(rapid_root); cd "$root"
+  [ ! -e .rapid/rapid ] || rapid_die "upgrade: this repository holds its own rapid (.rapid/rapid); it pins no version"
+  [ -f .rapid/version ] || rapid_die "upgrade: no .rapid/version here; run rapid setup first"
+  b=$(git symbolic-ref -q --short HEAD || true)
+  rapid_branch_parse "$b" >/dev/null 2>&1 || rapid_die "upgrade: open a branch first: rapid branch refactor upgrade-rapid"
+  clone=$(rapid_tool_clone "$RAPID_SELF")
+  if _pin_tool_git "$clone" remote get-url origin >/dev/null 2>&1; then
+    _pin_tool_git "$clone" fetch -q --tags origin || rapid_die "upgrade: could not fetch the tags of the installed rapid ($clone)"
+  fi
+  want="${1:-}"
+  if [ -z "$want" ]; then
+    want=$(_pin_tool_git "$clone" tag -l 'release/v[0-9]*' --sort=-v:refname | sed -n 1p)
+    [ -n "$want" ] || rapid_die "upgrade: the installed rapid holds no release; name a VERSION"
+  fi
+  rapid_pin_ok "$want" || RAPID_RC=2 rapid_die "upgrade: '$want' is not a version tag (v<series>.<n>)"
+  _pin_tool_git "$clone" rev-parse -q --verify "refs/tags/$want^{commit}" >/dev/null 2>&1 \
+    || rapid_die "$want is not in the installed rapid"
+  cur=$(sed -n 1p .rapid/version | tr -d '[:space:]')
+  # higher: the first number that differs is larger (a missing number counts as 0)
+  c=$(awk -v a="$(_pin_num "$want")" -v b="$(_pin_num "$cur")" 'BEGIN { n = split(a, x, " "); m = split(b, y, " "); k = n > m ? n : m
+      for (i = 1; i <= k; i++) { if (x[i] + 0 > y[i] + 0) { print 1; exit } if (x[i] + 0 < y[i] + 0) { print 0; exit } } print 0 }')
+  [ "$c" = 1 ] || rapid_die "upgrade: $want is not higher than the pinned $cur"
+  printf '%s\n' "$want" > .rapid/version
+
+  rapid_info "upgrade: $cur -> $want (.rapid/version); an admin commits it as [MODE] and lands the branch"
+}
+
 # ==== version
 # ---------------------------------------------------------------- version
 # _landed_at REV: the commit on dev's first-parent line that first held REV
@@ -3240,6 +3282,7 @@ case "${1:-}" in
   bisect) shift; cmd_bisect "$@" ;;
   status) shift; cmd_status "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
+  upgrade) shift; cmd_upgrade "$@" ;;
   version) shift; cmd_version "$@" ;;
   hook) shift; cmd_hook "$@" ;;
   queue) shift; cmd_queue "$@" ;;

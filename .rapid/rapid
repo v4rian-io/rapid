@@ -64,6 +64,8 @@
 #                                      --at: the version of the land that brought REV into dev
 #   rapid queue [--json]                 open branches in landing order, read-only: commits, how far behind dev, whether
 #                                      each merges into dev cleanly (conflicting files named), branches sharing files
+#   rapid bisect GOOD BAD -- CMD...      find the landed branch, then the commit, that broke CMD (Red: commits
+#                                      skipped; CMD exit 125 skips a commit it cannot test)
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
 #                                      I1 to I9, in full only after the last merge this clone verified (a note in
@@ -2534,6 +2536,107 @@ cmd_changelog() {
   [ "$n" -gt 0 ] || printf '\nNo landed merge in this range.\n'
 }
 
+# ---------------------------------------------------------------- bisect
+# rapid bisect GOOD BAD -- CMD...: find the commit that broke CMD. CMD exits 0
+# for good, 125 for "cannot test this commit" (the git bisect convention:
+# the commit is skipped) and anything else for bad. First a binary search
+# over dev's first-parent line between GOOD and BAD finds the landed merge
+# that broke it; then a binary search over that branch's own commits finds the
+# commit that broke it, skipping test-first commits that carry a Red: trailer. When a
+# skipped commit could have broken it, the report names it instead of
+# guessing. CMD runs in a private worktree at each commit.
+RAPID_BIS_WT=""
+RAPID_BIS_TESTED=0
+RAPID_BIS_SKIPPED=()
+_bis_run() {
+  git -C "$RAPID_BIS_WT" checkout -q --detach "$1" >/dev/null 2>&1 || rapid_die "cannot check out $1"
+  ( cd "$RAPID_BIS_WT" && "${RAPID_BIS_CMD[@]}" ) >/dev/null 2>&1
+}
+
+# _bis_search: binary search over RAPID_BIS_LIST (its last element is known
+# bad) for the first failing entry; a 125 exit drops the entry and goes on.
+# Sets RAPID_BIS_AT (the index of the first failing entry in the final list).
+_bis_search() {
+  local lo=0 hi=$(( ${#RAPID_BIS_LIST[@]} - 1 )) mid rc
+  while [ "$lo" -lt "$hi" ]; do
+    mid=$(( (lo + hi) / 2 )); rc=0
+    _bis_run "${RAPID_BIS_LIST[$mid]}" || rc=$?
+    RAPID_BIS_TESTED=$((RAPID_BIS_TESTED + 1))
+    if [ "$rc" = 125 ]; then
+      RAPID_BIS_SKIPPED+=("${RAPID_BIS_LIST[$mid]}")
+      RAPID_BIS_LIST=("${RAPID_BIS_LIST[@]:0:$mid}" "${RAPID_BIS_LIST[@]:$((mid + 1))}")
+      hi=$((hi - 1)); continue
+    fi
+    if [ "$rc" = 0 ]; then lo=$((mid + 1)); else hi=$mid; fi
+  done
+  RAPID_BIS_AT=$lo
+}
+
+# _bis_ambiguous PREV FOUND: the skipped commits between PREV (last good)
+# and FOUND (first bad), any of which could have broken it.
+_bis_ambiguous() {
+  local c s out=""
+  for c in $(git rev-list "$1..$2"); do
+    [ "$c" != "$2" ] || continue
+    for s in ${RAPID_BIS_SKIPPED[@]+"${RAPID_BIS_SKIPPED[@]}"}; do [ "$s" != "$c" ] || out="$out $(git rev-parse --short "$c")"; done
+  done
+  printf '%s' "$out"
+}
+
+cmd_bisect() {
+  local good bad root g b f p1 p2 c subj v broke="" skipped=0 rc prev amb
+  [ $# -ge 4 ] && [ "$3" = "--" ] || RAPID_RC=2 rapid_die "usage: rapid bisect GOOD BAD -- CMD [ARGS...]"
+  good="$1"; bad="$2"; shift 3
+  RAPID_BIS_CMD=("$@")
+  root=$(rapid_root); cd "$root"
+  g=$(git rev-parse -q --verify "$good^{commit}") || RAPID_RC=2 rapid_die "unknown revision $good"
+  b=$(git rev-parse -q --verify "$bad^{commit}") || RAPID_RC=2 rapid_die "unknown revision $bad"
+  git merge-base --is-ancestor "$g" "$b" || rapid_die "$good is not an ancestor of $bad"
+  RAPID_BIS_WT=$(rapid_tmpdir bisect)
+  git worktree add -q --detach "$RAPID_BIS_WT" "$b" >/dev/null 2>&1 || rapid_die "cannot make a private work tree under ${TMPDIR:-/tmp}; nothing changed"
+  trap 'git worktree remove --force "$RAPID_BIS_WT" >/dev/null 2>&1 || true' EXIT
+  rc=0; _bis_run "$g" || rc=$?
+  [ "$rc" = 0 ] || rapid_die "the command does not pass at $good (exit $rc); pick an older good revision"
+  rc=0; _bis_run "$b" || rc=$?
+  [ "$rc" != 0 ] || rapid_die "the command passes at $bad; nothing to find"
+  [ "$rc" != 125 ] || rapid_die "the command cannot test $bad (exit 125); pick a bad revision it can check"
+  RAPID_BIS_LIST=()
+  for c in $(git rev-list --first-parent --reverse "$g..$b"); do RAPID_BIS_LIST+=("$c"); done
+  _bis_search
+  f="${RAPID_BIS_LIST[$RAPID_BIS_AT]}"; subj=$(git log -1 --format=%s "$f"); v=$(rapid_version_of "$f")
+  if [ "$RAPID_BIS_AT" -gt 0 ]; then prev="${RAPID_BIS_LIST[$((RAPID_BIS_AT - 1))]}"; else prev="$g"; fi
+  rapid_info "dev: first failing commit $(git rev-parse --short "$f") $subj${v:+ ($v)}, after $RAPID_BIS_TESTED tested, ${#RAPID_BIS_SKIPPED[@]} skipped (exit 125)"
+  amb=$(_bis_ambiguous "$prev" "$f")
+  if [ -n "$amb" ]; then
+    rapid_info "ambiguous: the commit that broke it may also be the skipped commit(s)$amb"
+    rapid_info "broke $f"; return 0
+  fi
+  if [ "$(git rev-list --parents -n1 "$f" | wc -w | tr -d ' ')" != 3 ]; then
+    rapid_info "broke $f"; return 0
+  fi
+  p1=$(git rev-parse "$f^1"); p2=$(git rev-parse "$f^2")
+  RAPID_BIS_LIST=()
+  for c in $(git rev-list --reverse "$p1..$p2"); do
+    if [ -n "$(rapid_trailer "$c" Red)" ]; then skipped=$((skipped + 1)); continue; fi
+    RAPID_BIS_LIST+=("$c")
+  done
+  rc=1
+  if [ "${#RAPID_BIS_LIST[@]}" -gt 0 ]; then rc=0; _bis_run "${RAPID_BIS_LIST[$(( ${#RAPID_BIS_LIST[@]} - 1 ))]}" || rc=$?; fi
+  if [ "$rc" = 0 ] || [ "$rc" = 125 ]; then
+    rapid_info "every branch commit passes (or cannot be tested); the failure comes from the merge itself"
+    rapid_info "branch $(rapid_subject_kslash "$subj")"
+    rapid_info "broke $f"; return 0
+  fi
+  _bis_search
+  broke="${RAPID_BIS_LIST[$RAPID_BIS_AT]}"
+  if [ "$RAPID_BIS_AT" -gt 0 ]; then prev="${RAPID_BIS_LIST[$((RAPID_BIS_AT - 1))]}"; else prev="$p1"; fi
+  rapid_info "branch: first failing commit $(git rev-parse --short "$broke") $(git log -1 --format=%s "$broke") ($skipped marked red commit(s) skipped)"
+  amb=$(_bis_ambiguous "$prev" "$broke")
+  [ -z "$amb" ] || rapid_info "ambiguous: the commit that broke it may also be the skipped commit(s)$amb"
+  rapid_info "branch $(rapid_subject_kslash "$subj")"
+  rapid_info "broke $broke"
+}
+
 # ---------------------------------------------------------------- status
 cmd_status() {
   local root b v rel l ahead behind json=false sep="" oa="" ob=""
@@ -2930,6 +3033,7 @@ case "${1:-}" in
   sync) shift; cmd_sync "$@" ;;
   release) shift; cmd_release "$@" ;;
   changelog) shift; cmd_changelog "$@" ;;
+  bisect) shift; cmd_bisect "$@" ;;
   status) shift; cmd_status "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   version) shift; cmd_version "$@" ;;

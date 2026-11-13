@@ -55,6 +55,8 @@
 #                                      each landed merge by release, version, kind/name and its requirement
 #   rapid version [--next] [--at REV]    the last version on dev; --next: the one the next land takes;
 #                                      --at: the version of the land that brought REV into dev
+#   rapid queue [--json]                 open branches in landing order, read-only: commits, how far behind dev, whether
+#                                      each merges into dev cleanly (conflicting files named), branches sharing files
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
 #                                      I1 to I9, in full only after the last merge this clone verified (a note in
@@ -2561,6 +2563,99 @@ cmd_doctor() {
   return "$bad"
 }
 
+# ==== queue
+# ---------------------------------------------------------------- queue
+# _queue_branches: every open branch that carries commits dev lacks, one per line,
+# in landing order (by branch number, then by name; an unnumbered branch last).
+# Local branches and origin's as last fetched; a branch known in both places is
+# read from the local branch. Prints "<ref> <name>".
+_queue_branches() {
+  local r name seen=" "
+  # shellcheck disable=SC2086
+  for r in $(git for-each-ref --format='%(refname)' $RAPID_POOL_NS refs/remotes/origin/pool); do
+    name="${r#refs/heads/}"; name="${name#refs/remotes/origin/}"
+    case "$seen" in *" $name "*) continue ;; esac
+    seen="$seen$name "
+    rapid_branch_parse "$name" >/dev/null 2>&1 || continue
+    [ "$(git rev-list --count "dev..$r")" -gt 0 ] || continue
+    printf '%s %s %s\n' "$(rapid_branch_number "$name" | sed -E 's/^n([0-9]+).*/\1/')" "$r" "$name"
+  done | awk '{ if ($1 ~ /^[0-9]+$/) print; else print 999999999, $1, $2 }' | sort -k1,1n -k3,3 | awk '{ print $2, $3 }'
+}
+
+# _queue_json_list: stdin lines as the items of a JSON array of strings.
+_queue_json_list() {
+  awk 'BEGIN { printf "[" } NF { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "%s\"%s\"", (n++ ? ", " : ""), $0 } END { printf "]" }'
+}
+
+# rapid queue [--json]: the open branches in landing order, read-only (no fetch,
+# no ref, no file in the work tree). For each branch: its commits beyond dev,
+# how far it is behind dev, whether it merges into dev's tip cleanly (the
+# conflicting files named; "unknown" when this git has no merge-tree
+# --write-tree), and the other open branches that change a file it changes too,
+# so whoever lands picks the order with the fewest rebases. Nothing here
+# lands, merges or reorders anything.
+cmd_queue() {
+  local json=false root d list n=0 i j ref name base out rc sep=""
+  case "${1:-}" in --json) json=true ;; "") ;; *) RAPID_RC=2 rapid_die "queue: unknown argument $1" ;; esac
+  root=$(rapid_root); cd "$root"
+  git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
+  d=$(rapid_tmpdir queue)
+  list=$(_queue_branches)
+  while read -r ref name; do
+    [ -n "$ref" ] || continue
+    n=$((n + 1))
+    printf '%s\n' "$name" > "$d/$n.name"
+    git rev-list --count "dev..$ref" > "$d/$n.commits"
+    git rev-list --count "$ref..dev" > "$d/$n.behind"
+    base=$(git merge-base dev "$ref")
+    git diff --name-only "$base" "$ref" | LC_ALL=C sort > "$d/$n.files"
+    rc=0; out=$(git merge-tree --write-tree --name-only --no-messages dev "$ref" 2>/dev/null) || rc=$?
+    : > "$d/$n.conflicts"
+    case "$rc" in
+      0) echo clean > "$d/$n.merge" ;;
+      1) sed '1d;/^$/d' <<<"$out" > "$d/$n.conflicts"
+         if [ -s "$d/$n.conflicts" ]; then echo conflict > "$d/$n.merge"; else echo clean > "$d/$n.merge"; fi ;;
+      *) echo unknown > "$d/$n.merge" ;;
+    esac
+  done <<<"$list"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    i=$((i + 1)); : > "$d/$i.shares"; j=0
+    while [ "$j" -lt "$n" ]; do
+      j=$((j + 1)); [ "$j" != "$i" ] || continue
+      [ -z "$(LC_ALL=C comm -12 "$d/$i.files" "$d/$j.files")" ] || cat "$d/$j.name" >> "$d/$i.shares"
+    done
+  done
+  if $json; then
+    printf '['
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      i=$((i + 1)); name=$(cat "$d/$i.name")
+      printf '%s{"branch": "%s", "number": "%s", "commits": %s, "behind": %s, "merge": "%s", "conflicts": %s, "shares_files_with": %s}' \
+        "$sep" "$name" "$(rapid_branch_number "$name")" "$(cat "$d/$i.commits")" "$(cat "$d/$i.behind")" "$(cat "$d/$i.merge")" \
+        "$(_queue_json_list < "$d/$i.conflicts")" "$(_queue_json_list < "$d/$i.shares")"
+      sep=", "
+    done
+    printf ']\n'
+    rm -rf "$d"; return 0
+  fi
+  if [ "$n" = 0 ]; then rapid_info "queue: no open branch carries commits beyond dev"; rm -rf "$d"; return 0; fi
+  rapid_info "queue: $n open branch(es) in landing order, against dev $(git rev-parse --short dev)"
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    i=$((i + 1))
+    rapid_info "  $(cat "$d/$i.name")  $(cat "$d/$i.commits") commit(s), $(cat "$d/$i.behind") behind dev"
+    case "$(cat "$d/$i.merge")" in
+      clean) rapid_info "      merge into dev: clean" ;;
+      conflict) rapid_info "      merge into dev: conflicts in: $(tr '\n' ' ' < "$d/$i.conflicts" | sed 's/ $//')" ;;
+      *) rapid_info "      merge into dev: unknown (this git cannot merge without a work tree)" ;;
+    esac
+    if [ -s "$d/$i.shares" ]; then rapid_info "      shares files with: $(tr '\n' ' ' < "$d/$i.shares" | sed 's/ $//')"
+    else rapid_info "      shares files with: none"; fi
+  done
+  rm -rf "$d"
+}
+
 # ==== version
 # ---------------------------------------------------------------- version
 # _landed_at REV: the commit on dev's first-parent line that first held REV
@@ -2665,6 +2760,7 @@ case "${1:-}" in
   status) shift; cmd_status "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   version) shift; cmd_version "$@" ;;
+  queue) shift; cmd_queue "$@" ;;
   -h|--help) usage 0 ;;
   *) usage 2 ;;
 esac

@@ -27,6 +27,8 @@
 #                                      (--save writes it: .rapid/REQUIREMENTS.md, or FILE)
 #   rapid check --audit [REV]            the commit audit (message rules, joiners, Cause and Fix,
 #                                      size, a behaviour change with its test) on the branch, or a merge's branch
+#   rapid check --merge REV              the forge's verification of a land --pr candidate (shape, gates, approvals);
+#                                      REV defaults to HEAD
 #   rapid land [-F BODY] [--dry-run] [--failed-gates-only] [--verbose]
 #                                      merge the current branch into dev once, tagged, then close the open
 #                                      batch: this branch and every one landed with --batch are tested once on
@@ -719,12 +721,38 @@ _check_audit() {
   return "$fails"
 }
 
+# _check_merge REV: the forge's verification of a land --pr candidate. REV must be
+# a merge rapid land would make on its first parent (I1 to I4, I8), its gates
+# must pass again on its own tree, and with land_pr=required at its first
+# parent, its PR must hold land_approvals approvals given on REV itself.
+_check_merge() {
+  local m p1 v rel out repo n need have
+  m=$(git rev-parse -q --verify "$1^{commit}") || RAPID_RC=2 rapid_die "unknown revision $1"
+  [ "$(git rev-list --parents -n1 "$m" | wc -w | tr -d ' ')" = 3 ] || rapid_die "$1 is not a merge"
+  p1=$(git rev-parse "$m^1")
+  read -r v rel <<<"$(rapid_version_last "$p1")"
+  out=$(rapid_check_merge "$m" "$v" "$rel" | grep -v '^OK ' | grep -v '^I2 .* carries 0 version tags' || true)
+  [ -z "$out" ] || { printf '%s\n' "$out" >&2; rapid_die "$1 is not a merge rapid land would make"; }
+  out=$(rapid_verify_merge "$m")
+  [ -z "$out" ] || { printf '%s\n' "$out" >&2; rapid_die "$1's gates do not pass on its tree"; }
+  if [ "$(RAPID_CONF_REV="$p1" rapid_conf land_pr optional)" = required ]; then
+    repo="${GITHUB_REPOSITORY:-$(_forge_repo)}"
+    n=$(gh api "repos/$repo/commits/$m/pulls" --jq '.[0].number // empty' 2>/dev/null || true)
+    [ -n "$n" ] || rapid_die "no PR has $(git rev-parse --short "$m") as its head; land --pr opens it"
+    need=$(RAPID_CONF_REV="$p1" rapid_conf land_approvals 1)
+    have=$(_pr_approvals "$repo" "$n" "$m")
+    [ "$have" -ge "$need" ] || rapid_die "PR #$n has $have of $need approval(s) on $(git rev-parse --short "$m")"
+  fi
+  rapid_info "ok: $(git rev-parse --short "$m") is a valid land candidate; gates pass on its tree"
+}
+
 cmd_check() {
   local gate=fast each=false root res
   while [ $# -gt 0 ]; do
     case "$1" in
       --gate) gate="${2:-}"; shift 2 ;;
       --each) each=true; shift ;;
+      --merge) _check_merge "${2:-HEAD}"; return ;;
       --audit) shift; _check_audit_cmd "$@"; return ;;
       --reqs) shift; _check_reqs "$@"; return ;;
       *) RAPID_RC=2 rapid_die "check: unknown argument $1" ;;

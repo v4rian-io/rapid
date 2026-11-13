@@ -1766,3 +1766,268 @@ def check_push(sargs, gdir, raw):
         return "remote branch deletion"
     return None
 
+
+def require_preflight(destructive, gdir, git_dir, sargs, sub, ctx, raw):
+    if gdir is None or (git_dir and not os.path.isabs(git_dir) and gdir is None):
+        deny("Destructive git blocked (rapid preflight): %s on a repository given by a run-time value; the guard "
+             "cannot check its preflight. Run it with a literal path (git -C <repo>). Offending: %s" % (destructive, raw))
+    root = git("rev-parse", "--show-toplevel", cwd=gdir) if os.path.isdir(gdir) else None
+    if not root:
+        deny("Destructive git blocked (rapid preflight): %s but %s is not inside a git repo, so the preflight cannot be "
+             "checked. Run it from inside the repo (cd <repo> && ...) or with git -C <repo>. Offending: %s" % (destructive, gdir, raw))
+    root_p = _real(root)
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=root)
+    gitdir = git("rev-parse", "--path-format=absolute", "--git-dir", cwd=root)
+    common_p = _real(common) if common else ""
+    gitdir_p = _real(gitdir) if gitdir else ""
+    linked = bool(common_p) and common_p != gitdir_p
+    mainroot = common_p[:-5] if common_p.endswith("/.git") else common_p
+
+    if is_tmp(root_p) and common_p and is_tmp(common_p):
+        if destructive not in ("force push", "remote branch deletion"):
+            return
+        remote_ok = not any(re.search(r"://|^[^/\s]+@[^\s]+:", a) for a in sargs)
+        cfg = git("config", "--get-regexp", r"^remote\..*\.(url|pushurl)$", cwd=root) or ""
+        for line in cfg.splitlines():
+            url = line.split(None, 1)[1] if " " in line else ""
+            u = url[7:] if url.startswith("file://") else url
+            if not u.startswith("/"):
+                u = os.path.join(root_p, u)
+            if not is_tmp(_real(u)):
+                remote_ok = False
+        if remote_ok:
+            return
+
+    def wt_dirty():
+        if destructive in ("git reset --hard", "git checkout --force", "git restore", "git switch --discard-changes",
+                           "git read-tree -u (overwrites the working tree)", "git checkout-index -f (overwrites the working tree)",
+                           "git rm -f (drops uncommitted changes)"):
+            return git("status", "--porcelain", "--untracked-files=no", cwd=root) or ""
+        if destructive == "git clean -f":
+            ignored = any(re.fullmatch(r"-[a-zA-Z]*[xX][a-zA-Z]*", a) for a in sargs)
+            st = git("status", "--porcelain", "--untracked-files=all", *(["--ignored"] if ignored else []), cwd=root) or ""
+            return "\n".join(l for l in st.splitlines() if l.startswith("??") or l.startswith("!!"))
+        return ""
+
+    wt_deny = ("Destructive git blocked (rapid preflight): %s in linked worktree %s, whose uncommitted changes the main "
+               "repo's preflight does not cover. Run first: \"%s\" \"%s\" \"before %s\"  then retry the exact command."
+               % (destructive, root, PF, root, destructive))
+    if root_p in ctx.pf_roots:
+        return
+    if linked and mainroot in ctx.pf_roots:
+        if not wt_dirty():
+            return
+        deny(wt_deny)
+
+    ok, why = preflight_matches(root, root_p)
+    if ok:
+        return
+    if linked:
+        ok_main, _ = preflight_matches(mainroot, mainroot)
+        if ok_main:
+            if not wt_dirty():
+                return
+            deny(wt_deny)
+    deny("Destructive git blocked (rapid preflight): %s on %s: %s. Run first: \"%s\" \"%s\" \"before %s\"  then retry "
+         "the exact command, or chain both in one command (\"%s\" \"%s\" \"...\" && <command>)."
+         % (destructive, root, why, PF, root, destructive, PF, root))
+
+
+def preflight_matches(root, root_p):
+    """(True, "") when a preflight backup covers the repository as it is now."""
+    # the backup ref is local: git-preflight.sh pushes nothing
+    pattern, where = "refs/heads/", "in this clone"
+    refs = git("for-each-ref", "--sort=-committerdate", "--format=%(committerdate:unix) %(refname)", pattern, cwd=root) or ""
+    head = git("rev-parse", "--verify", "-q", "HEAD", cwd=root) or ""
+    now, limit = time.time(), MAXH * 3600
+    changed = None
+    for line in refs.splitlines():
+        ts, ref = line.split(" ", 1)
+        if "/preflight-bak-" not in ref:
+            continue
+        ts = int(ts)
+        if now - ts > limit:
+            return False, "no preflight-bak-* ref %s within %dh" % (where, MAXH)
+        parent = git("rev-parse", "--verify", "-q", ref + "^1", cwd=root) or ""
+        if parent != head:
+            continue
+        body = git("log", "-1", "--format=%B", ref, cwd=root) or ""
+        m = re.search(r"^Zip: (.+)$", body, re.M)
+        zipf = m.group(1).strip() if m else ""
+        name = os.path.basename(root)
+        # the preflight is of this repository (a linked worktree's own, not its main repo's)
+        if not os.path.basename(zipf).startswith(name + "-bak-"):
+            continue
+        if not os.path.isfile(zipf) or now - os.path.getmtime(zipf) > limit:
+            return False, "no %s-bak-*.zip in %s within %dh" % (name, BAKS, MAXH)
+        if changed is None:
+            st = git("status", "--porcelain", "--untracked-files=all", "-z", cwd=root) or ""
+            changed = [e[3:] for e in st.split("\0") if len(e) > 3]
+        for path in changed:
+            full = os.path.join(root, path)
+            try:
+                if os.path.getmtime(full) > ts + 1:
+                    return False, "%s changed after the newest matching preflight" % path
+            except OSError:
+                continue
+        return True, ""
+    return False, "no preflight-bak-* ref %s for the current HEAD within %dh" % (where, MAXH)
+
+
+PROTECTED_MSG = ("Write blocked (rapid protocol): a .rapid copy is never edited; change the canonical "
+                "framework repo. Path: %s")
+
+
+def protected(path):
+    """True when an absolute path lies inside the .rapid directory of a repository that is not the
+    framework's own: the real path (symlinks resolved, compared case-insensitively) is under a
+    namespace dir whose repo does not track .rapid/rapid (an untracked file someone just created
+    does not count)."""
+    rp = _real(path)
+    parts = rp.split("/")
+    low = [x.lower() for x in parts]
+    if ".rapid" not in low:
+        return False
+    k = low.index(".rapid")
+    root = "/".join(parts[:k]) or "/"
+    # conf and admins are the consumer's own files inside .rapid, and so is the project's data there:
+    # its requirement files, its tests, its version pin
+    if low[k + 1:] in (["conf"], ["admins"], ["version"]):
+        return False
+    if low[k + 1:k + 2] in (["requirements"], ["tests"]) and len(low) > k + 2:
+        return False
+    marker = ".rapid/rapid"
+    if os.path.isfile(os.path.join(root, marker)) and git("ls-files", "--error-unmatch", marker, cwd=root) is not None:
+        return False
+    return True
+
+
+STORE_MSG = ("Write blocked (rapid guard): %s is rapid's own state under the git common dir (rapid/: the open "
+             "batch; the rapid-close note); only rapid writes it. A hand-written close note would let "
+             "pre-push skip a merge's fast gate. Run the gates through 'rapid land'. Path: %s")
+
+
+def rapid_state(path):
+    """The kind of rapid state an absolute path lies in, or None: under <git common dir>/rapid/ (the open
+    batch) or at <git common dir>/refs/notes/rapid-close. A git common dir is an ancestor
+    holding HEAD and objects/; a scratch repository under a temp root is exempt, like every repo rule."""
+    rp = _real(path)
+    parts = rp.split("/")
+    for k in range(len(parts) - 1, 0, -1):
+        a = "/".join(parts[:k]) or "/"
+        if not (os.path.isfile(os.path.join(a, "HEAD")) and os.path.isdir(os.path.join(a, "objects"))):
+            continue
+        rest = parts[k:]
+        if is_tmp(a):
+            return None
+        if rest[:1] == ["rapid"]:
+            return "the rapid state directory"
+        if rest[:3] == ["refs", "notes", "rapid-close"]:
+            return "the rapid-close note ref"
+        return None
+    return None
+
+
+def check_rapid_state(p):
+    if p is None:
+        return
+    what = rapid_state(p)
+    if what:
+        deny(STORE_MSG % (what, p))
+
+
+WRITE_CMDS = {"tee", "touch", "truncate", "cp", "mv", "install", "ln", "rsync", "dd", "sed", "perl", "patch"}
+
+
+def check_bash_writes(name, args, redirs, ctx, env):
+    targets = [t for op, t in redirs if op in (">", ">>", ">|", "&>", "&>>", "<>") and t is not None]
+    texts = [w.text for w in args]
+    if name in ("tee", "touch", "truncate"):
+        targets += [w for w in args if not w.text.startswith("-")]
+    elif name in ("cp", "mv", "install", "ln", "rsync"):
+        pos = [w for w in args if not w.text.startswith("-")]
+        if "-t" in texts and texts.index("-t") + 1 < len(args):
+            targets.append(args[texts.index("-t") + 1])
+        elif pos:
+            targets.append(pos[-1])
+    elif name in ("sed", "perl") and any(t == "-i" or t.startswith("-i") or t.startswith("--in-place") or re.fullmatch(r"-[a-zA-Z]*i[a-zA-Z]*", t) for t in texts):
+        targets += [w for w in args if not w.text.startswith("-")][1:]
+    elif name == "dd":
+        targets += [Word(w.text[3:], w.dynamic, w.raw) for w in args if w.text.startswith("of=")]
+    elif name in ("trash", "mkdir"):
+        targets += [w for w in args if not w.text.startswith("-")]
+    elif name == "chmod":
+        # chmod -x on a hook makes git skip it; the mode word is no path under .rapid, so every word is tried
+        targets += [w for w in args if not w.text.startswith("-")]
+    for w in targets:
+        p = expand(w, ctx.cwd, env)
+        if p is not None and protected(p):
+            deny(PROTECTED_MSG % p)
+        # rapid's own state under the git common dir is written by rapid only (audit 4 H3)
+        check_rapid_state(p)
+
+
+def main_write():
+    """PreToolUse(Write|Edit|NotebookEdit) entry: deny a write into a protected .rapid."""
+    try:
+        inp = json.loads(sys.stdin.read())
+        ti = inp.get("tool_input") or {}
+        fp = ti.get("file_path") or ti.get("notebook_path")
+        cwd = inp.get("cwd") or os.getcwd()
+    except (ValueError, AttributeError):
+        emit_deny("rapid guard: the hook input is not valid JSON; the write was not checked, so it is refused.")
+        return
+    if not fp:
+        return
+    path = fp if fp.startswith("/") else os.path.join(cwd, fp)
+    try:
+        if protected(os.path.normpath(path)):
+            emit_deny(PROTECTED_MSG % fp)
+            return
+        what = rapid_state(os.path.normpath(path))
+        if what:
+            emit_deny(STORE_MSG % (what, fp))
+    except Exception as e:
+        emit_deny("rapid guard: internal error (%s: %s); the write was refused." % (type(e).__name__, e))
+
+
+TEMP_ROOTS = None
+
+
+def main():
+    global TEMP_ROOTS
+    data = sys.stdin.read()
+    try:
+        inp = json.loads(data)
+        cmd = (inp.get("tool_input") or {}).get("command")
+        cwd = inp.get("cwd") or os.getcwd()
+    except (ValueError, AttributeError):
+        emit_deny("rapid guard: the hook input is not valid JSON; the command was not checked, so it is refused.")
+        return
+    if isinstance(cmd, list):
+        cmd = " ".join(str(x) for x in cmd)
+    if not cmd:
+        return
+    if len(cmd) > MAX_CMD:
+        emit_deny("rapid guard: the command is %d characters, more than the %d the guard checks; split it into "
+                  "smaller commands." % (len(cmd), MAX_CMD))
+        return
+    TEMP_ROOTS = _temp_roots()
+    ctx = Ctx(os.path.normpath(cwd), cmd)
+    try:
+        parse_script(cmd, ctx)
+    except Deny as d:
+        emit_deny(str(d))
+    except Unparseable as u:
+        emit_deny("rapid guard: the command could not be parsed (%s), so it is refused; fix the quoting or split it." % u)
+    except Exception as e:  # fail closed on any defect of the guard itself
+        emit_deny("rapid guard: internal error (%s: %s); the command was refused. Report it with the command." %
+                  (type(e).__name__, e))
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--write"]:
+        TEMP_ROOTS = _temp_roots()
+        main_write()
+    else:
+        main()

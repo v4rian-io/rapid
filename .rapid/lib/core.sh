@@ -153,6 +153,8 @@ rapid_branch_name() { printf 'pool/%s/%s%s.%s' "${4:-$(rapid_series)}" "${3:+$3.
 # rapid_subject_branch SUBJECT: the branch a land's merge subject names
 # ("[MERGE] pool/v<series>/<number>.<kind>.<name> into dev: <version>"); empty for any other subject.
 rapid_subject_branch() { sed -nE 's/^\[MERGE\] (pool\/[^ ]+) into dev: .*/\1/p' <<<"$1"; }
+# rapid_subject_kslash SUBJECT -> "<kind>/<name>", the short name of that branch in reports.
+rapid_subject_kslash() { local ks; ks=$(rapid_subject_ks "$1"); [ -z "$ks" ] || printf '%s' "${ks/ //}"; }
 # rapid_subject_ks SUBJECT -> "kind name" of that branch (empty when the subject names none).
 rapid_subject_ks() { local p; p=$(rapid_subject_branch "$1"); [ -z "$p" ] || rapid_branch_parse "$p" || true; }
 

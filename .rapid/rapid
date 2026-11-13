@@ -3,6 +3,9 @@
 #
 # Usage:
 #   rapid setup                          activate hooks, seed main and dev; the human runner is the first admin
+#   rapid setup --owner EMAIL [--owner-name NAME]
+#                                      the first setup names EMAIL the owner, the first admin, never its runner
+#                                      (NAME: the owner's name, beside the address)
 #   rapid setup --require-test          the first setup writes requirement_test=required: every branch states
 #                                      its requirement and its test (later: a [MODE] change of .rapid/conf)
 #   rapid branch <kind> <name> [-r TEXT] [--test PATH] [--ticket ID]
@@ -110,6 +113,29 @@ usage_verb() {
   exit 0
 }
 
+# ---------------------------------------------------------------- setup
+# _setup_owner_args [--owner EMAIL [--owner-name NAME]] [--require-test] [--pin VERSION]: the flags of setup.
+# The one who initializes a repository is often not its owner (an agent never is),
+# so the first setup may name the owner: the global _setup_owner carries the address
+# to _setup_owner_write. The address is data of the run, never of the framework.
+# --owner-name carries the owner's name in _setup_owner_name. --require-test sets
+# _setup_reqtest for _setup_conf_write. --pin carries the tag to pin to _setup_stubs.
+_setup_owner_args() {
+  local named=0 name=0
+  _setup_owner=""; _setup_owner_name=""; _setup_reqtest=0; _setup_pin=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --owner) named=1; _setup_owner="${2:-}"; [ -n "$_setup_owner" ] || RAPID_RC=2 rapid_die "setup: --owner needs an email"; shift 2 ;;
+      --owner-name) name=1; _setup_owner_name="${2:-}"; [ -n "$_setup_owner_name" ] || RAPID_RC=2 rapid_die "setup: --owner-name needs a name"; shift 2 ;;
+      --require-test) _setup_reqtest=1; shift ;;
+      --pin) _setup_pin="${2:-}"; [ -n "$_setup_pin" ] || RAPID_RC=2 rapid_die "setup: --pin needs a version"; shift 2 ;;
+      *) RAPID_RC=2 rapid_die "setup: unknown argument $1" ;;
+    esac
+  done
+  [ "$name" = 0 ] || [ "$named" = 1 ] || RAPID_RC=2 rapid_die "setup: --owner-name needs --owner EMAIL"
+  [ "$named" = 0 ] || [[ "$_setup_owner" =~ ^[^[:space:]@]+@[^[:space:]@]+$ ]] || RAPID_RC=2 rapid_die "setup: --owner '$_setup_owner' is not an email"
+}
+
 # _setup_first: 0 at the first setup of a repository: it has no commit, or it has commits but
 # no seed (no committed .rapid/ and no dev here or on origin), which the seed commit then
 # goes on top of.
@@ -143,8 +169,21 @@ _setup_conf_write() {
   esac
 }
 
+# _setup_owner_write: write the owner rapid setup --owner named as the first admin
+# in .rapid/admins (the working copy's own file, excluded from git by default), in place of the runner.
+# It names an owner wherever the file names nobody yet.
+# Without the flag it does nothing.
+_setup_owner_write() {
+  local e="${_setup_owner:-}"
+  [ -n "$e" ] || return 0
+  [ -z "$(RAPID_CONF_REV="" rapid_admins)" ] || rapid_die "setup --owner: .rapid/admins already names an admin ($(RAPID_CONF_REV="" rapid_admins | tr '\n' ' ' | sed 's/ $//'))"
+  printf '# Admins: one email per line. They alone change .rapid/conf, in [MODE] commits, and release. This file stays in this working copy unless an admin commits it.\n%s\n' "$e${_setup_owner_name:+ # $_setup_owner_name}" > .rapid/admins
+  rapid_info "admin: $e, named by --owner (the admins flip policy in [MODE] commits and promote dev to main)"
+}
+
 cmd_setup() {
   case "${1:-}" in
+    --owner|--owner-name|--require-test|--pin) _setup_owner_args "$@" ;;
     "") ;;
     *) RAPID_RC=2 rapid_die "setup: unknown argument $1" ;;
   esac
@@ -161,6 +200,7 @@ cmd_setup() {
   email=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -E 's/.*<([^>]*)>.*/\1/') || email=""
   local uname; uname=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -E 's/^(.*) <[^>]*>.*$/\1/') || uname=""
   _setup_conf_write
+  _setup_owner_write
   # main is production and the admins alone promote dev to main and flip policy: every
   # setup of a working copy that names no admin yet names the setup author (never an
   # agent), from git's user.email and user.name; the file stays in this working copy only

@@ -50,6 +50,8 @@
 #                                      main is production: only the owner promotes (release_who), never an agent;
 #                                      with release_build, the artifacts built on the tag, gated and listed in it
 #   rapid release --publish [VERSION]    ship a release's gated artifacts again (release_publish, the forge's release)
+#   rapid changelog [--from REV] [TO]    the changelog from history up to TO (default dev's tip), after REV:
+#                                      each landed merge by release, version, kind/name and its requirement
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
 #                                      I1 to I9, in full only after the last merge this clone verified (a note in
@@ -2355,6 +2357,57 @@ _release_tag_resume() {
   rapid_info "released $v: pushed the release tag of the merge $(git rev-parse --short "$m") already on main"
 }
 
+# ---------------------------------------------------------------- changelog
+# rapid changelog [--from REV] [TO]: the changelog, generated from history (no
+# CHANGELOG.md is kept: this is it). It walks TO's first-parent line (default
+# dev's tip), after REV when --from names one, newest first, and groups the
+# landed merges by the release that first shipped them (release/<version>
+# on the released dev commit), the merges after the last release under
+# "Unreleased". One line per merge: its version tag, kind/name from the
+# canonical subject, and the requirement it met, read from the file its
+# Requirement: trailer names, as committed in that merge (first paragraph,
+# one line). The output is a pure function of history: the same refs give
+# the same bytes.
+cmd_changelog() {
+  local from="" to="" root tip range c v subj ks req path text group="" cur="" n=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from) [ -n "${2:-}" ] || RAPID_RC=2 rapid_die "changelog: --from needs a revision"; from="$2"; shift 2 ;;
+      -*) RAPID_RC=2 rapid_die "changelog: unknown argument $1" ;;
+      *) [ -z "$to" ] || RAPID_RC=2 rapid_die "changelog: one end revision at most"; to="$1"; shift ;;
+    esac
+  done
+  root=$(rapid_root); cd "$root"
+  tip=$(git rev-parse -q --verify "${to:-dev}^{commit}") || RAPID_RC=2 rapid_die "unknown revision ${to:-dev}"
+  range="$tip"
+  if [ -n "$from" ]; then
+    from=$(git rev-parse -q --verify "$from^{commit}") || RAPID_RC=2 rapid_die "unknown revision for --from"
+    git merge-base --is-ancestor "$from" "$tip" || rapid_die "--from $(git rev-parse --short "$from") is not an ancestor of $(git rev-parse --short=12 "$tip")"
+    range="$from..$tip"
+  fi
+  v=$(rapid_version_of "$tip")
+  printf '# Changelog up to %s (%s)' "${v:-untagged}" "$(git rev-parse --short=12 "$tip")"
+  [ -z "$from" ] || printf ', after %s (%s)' "$(v=$(rapid_version_of "$from"); printf '%s' "${v:-untagged}")" "$(git rev-parse --short=12 "$from")"
+  printf '\n'
+  # shellcheck disable=SC2086
+  for c in $(git rev-list --first-parent $range); do
+    [ "$(git rev-list --parents -n1 "$c" | wc -w | tr -d ' ')" = 3 ] || continue
+    subj=$(git log -1 --format=%s "$c")
+    ks=$(rapid_subject_kslash "$subj")
+    [ -n "$ks" ] || continue
+    v=$(rapid_version_of "$c")
+    if [ -n "$v" ] && git rev-parse -q --verify "refs/tags/release/$v" >/dev/null; then group="release/$v"; fi
+    [ -n "$group" ] || group="Unreleased"
+    if [ "$group" != "$cur" ]; then printf '\n## %s\n\n' "$group"; cur="$group"; fi
+    path=$(rapid_trailer "$c" Requirement)
+    text=""
+    [ -z "$path" ] || text=$(git show "$c:$path" 2>/dev/null | awk 'd { next } NR == 1 && /^#/ { next } /^[[:space:]]*$/ { if (s) d = 1; next } { s = 1; printf "%s%s", (n++ ? " " : ""), $0 }')
+    printf -- '- %s %s: %s\n' "${v:-untagged}" "$ks" "${text:-<no requirement>}"
+    n=$((n + 1))
+  done
+  [ "$n" -gt 0 ] || printf '\nNo landed merge in this range.\n'
+}
+
 # ---------------------------------------------------------------- status
 cmd_status() {
   local root b v rel l ahead behind json=false sep="" oa="" ob=""
@@ -2529,6 +2582,7 @@ case "${1:-}" in
   land) shift; cmd_land "$@" ;;
   sync) shift; cmd_sync "$@" ;;
   release) shift; cmd_release "$@" ;;
+  changelog) shift; cmd_changelog "$@" ;;
   status) shift; cmd_status "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   -h|--help) usage 0 ;;

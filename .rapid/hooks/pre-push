@@ -84,6 +84,8 @@ while read -r lref lsha rref rsha; do
           if git cat-file -e "$c:.rapid/version" 2>/dev/null || git show "$c:.rapid/lib/policy.sh" 2>/dev/null | grep -F 'release_who' >/dev/null; then
             gov=$(release_gov "$c")
             tagger=$(git for-each-ref --format='%(taggeremail)' "refs/tags/$t" | tr -d '<>')
+            why=$(rapid_policy_may_release "$gov" "$c" "$tagger") \
+              || fail "release tag $t was tagged by '${tagger:-<none>}': $why"
           fi ;;
       esac ;;
     refs/heads/dev|refs/heads/main)
@@ -145,6 +147,8 @@ while read -r lref lsha rref rsha; do
             [ -n "$v" ] && [ "$(git cat-file -t "refs/tags/release/$v" 2>/dev/null)" = tag ] \
               || fail "main only moves to a release made by rapid release (an annotated release/<version>)"
             tagger=$(git for-each-ref --format='%(taggeremail)' "refs/tags/release/$v" | tr -d '<>')
+            why=$(rapid_policy_may_release "$gov" "$rc" "$tagger") \
+              || fail "release/$v was tagged by '${tagger:-<none>}': $why"
           done
         fi
       fi ;;

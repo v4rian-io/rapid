@@ -41,6 +41,9 @@
 #                                      --push then lease-pushes the branch to origin)
 #   rapid sync --dev [--continue|--abort] reconcile local dev with origin: fast-forward, publish, or re-land
 #                                      (a stopped re-land resumes with --continue; --abort keeps the rest as branches not landed yet)
+#   rapid release [VERSION] [--dry-run] [--verbose]  release dev's tip: release gate, release/<v> tag, a release merge on main;
+#                                      main is production: only the owner promotes (release_who), never an agent;
+#                                      with release_build, the artifacts built on the tag, gated and listed in it
 #   rapid status [--json]                where you are, open branches, last version
 #   rapid doctor [--fix] [--history [--all|--since REV]] [--verbose] check the install (--fix repairs hooks), and with --history
 #                                      I1 to I9, in full only after the last merge this clone verified (a note in
@@ -1917,6 +1920,183 @@ _rl_abort() {
   rapid_info "re-land aborted; dev is at origin's dev ($(git rev-parse --short dev)); branches not landed yet are listed above"
 }
 
+# ---------------------------------------------------------------- release
+# _open_branches_report DEV: the work still open when a release is cut, oldest
+# first, as "- <branch> <first commit date> - <last commit date> (<n> commits)":
+# origin's branches when there is a remote (fetched now), else this clone's.
+# Open branches are refs that move; the release tag is where the snapshot stays.
+_open_branches_report() {
+  local d="$1" r name n first last ns="$RAPID_POOL_NS" seen="" out=""
+  if rapid_has_remote && git fetch -q --prune origin '+refs/heads/pool/*:refs/remotes/origin/pool/*' 2>/dev/null; then
+    ns="refs/remotes/origin/pool $RAPID_POOL_NS"
+  fi
+  # shellcheck disable=SC2086
+  for r in $(git for-each-ref --format='%(refname)' $ns); do
+    name="${r#refs/heads/}"; name="${name#refs/remotes/origin/}"
+    case " $seen " in *" $name "*) continue ;; esac
+    seen="$seen $name"
+    n=$(git rev-list --no-merges --count "$d..$r"); [ "$n" -gt 0 ] || continue
+    first=$(git log --no-merges --reverse --date=short --format=%ad "$d..$r" | sed -n 1p)
+    last=$(git log --no-merges -1 --date=short --format=%ad "$d..$r")
+    out="$out$first $name $last $n
+"
+  done
+  if [ -z "$out" ]; then printf 'Open branches at release: none.\n'; return 0; fi
+  printf 'Open branches at release, oldest first:\n'
+  sort <<<"$out" | sed '/^$/d' | while read -r first name last n; do printf -- '- %s %s - %s (%s commits)\n' "$name" "$first" "$last" "$n"; done
+}
+
+# rapid release [VERSION] [--dry-run]: release dev's tip. main is production,
+# so first the actor must be the owner by main's own policy
+# (rapid_policy_may_release); a dry run the policy refuses still runs the release gate and ends
+# with the refusal, never a "would release" line. The release gate runs
+# on that exact tree; then release/<version> is tagged on it and main takes
+# it by a --no-ff release merge "[MERGE] dev into main: <version>" (the
+# released tree, the branches since the last release in its body), in one
+# atomic push when there is a remote, so git log --first-parent main lists
+# the releases. The next land opens the next series (version.sh).
+cmd_release() {
+  local want="" dry=false publish=false root dev_tip v wt g main_old
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=true; RAPID_DRY=1; shift ;;
+      --verbose) export RAPID_VERBOSE=1; shift ;;
+      --publish) publish=true; shift ;;
+      -*) RAPID_RC=2 rapid_die "release: unknown argument $1" ;;
+      *) want="$1"; shift ;;
+    esac
+  done
+  root=$(rapid_root); cd "$root"
+  [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit or stash them first"
+  git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
+  _sync_dev_from_origin
+  if rapid_has_remote && [ "$RAPID_OFFLINE" = 1 ]; then rapid_die "origin is unreachable; a release is published atomically, so retry when it is back"; fi
+  dev_tip=$(git rev-parse dev)
+  v=$(rapid_version_of "$dev_tip")
+  [ -n "$v" ] || rapid_die "dev's tip carries no version; land a branch first"
+  [ -z "$want" ] || [ "$want" = "$v" ] || rapid_die "release tags dev's tip, which is $v (asked for $want); land or wait until dev is where you want it"
+  main_old=$(git rev-parse main)
+  # the release merge goes on top of main as origin holds it
+  if rapid_has_remote && git fetch -q origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null; then
+    local om; om=$(git rev-parse refs/remotes/origin/main)
+    if [ "$om" != "$main_old" ]; then
+      git merge-base --is-ancestor "$main_old" "$om" || rapid_die "local main and origin main diverged; run 'rapid doctor --history'"
+      _move_branch main "$om" "$main_old"; main_old="$om"
+    fi
+  fi
+  # a release merged on the forge whose tag push failed: tag it now (the merge is already checked)
+  if [ "$(git log -1 --format=%s "$main_old")" = "[MERGE] dev into main: $v" ] && [ "$(git rev-parse -q --verify "$main_old^2")" = "$dev_tip" ] \
+     && [ -z "$(git ls-remote origin "refs/tags/release/$v" 2>/dev/null)" ]; then
+    _release_merge_ok "$main_old" "$(git rev-parse "$main_old^1")" "$dev_tip" "$v" || rapid_die "main's merge for $v is not a release merge (above); tell the owner"
+    _release_tag_resume "$v" "$dev_tip" "$main_old"; return 0
+  fi
+  git rev-parse -q --verify "refs/tags/release/$v" >/dev/null && rapid_die "$v is already released"
+  local devfp rel_old
+  devfp=$(git rev-list --first-parent "$dev_tip")
+  [ -z "$(rapid_main_check "$main_old" "$dev_tip")" ] || rapid_die "main breaks I5: $(rapid_main_check "$main_old" "$dev_tip" | sed -n 1p); run 'rapid doctor --history'"
+  rel_old=$(rapid_release_point "$main_old" "$devfp")
+  git merge-base --is-ancestor "$rel_old" "$dev_tip" || rapid_die "main's last release is not on dev (I5); run 'rapid doctor --history'"
+  # main is production: only the owner promotes, as main's own policy says
+  local ae an ce why
+  ae=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -nE 's/^.* <([^>]*)>.*$/\1/p') || ae=""
+  an=$(git var GIT_AUTHOR_IDENT 2>/dev/null | sed -E 's/^(.*) <[^>]*>.*$/\1/') || an=""
+  ce=$(git var GIT_COMMITTER_IDENT 2>/dev/null | sed -nE 's/^.* <([^>]*)>.*$/\1/p') || ce=""
+  why=$(rapid_policy_may_release "$main_old" "$dev_tip" "$ae" "$ce") && why=""
+  # an agent session is an agent whatever identity it exports
+  local sm
+  if [ -z "$why" ] && sm=$(RAPID_CONF_REV="$dev_tip" rapid_agent_session); then
+    why="main is production; this is an agent session ($sm is set) and an agent never promotes dev to main: report that dev is ready"
+  fi
+  # a dry run the policy refuses still runs the release gate, then ends with the refusal
+  [ -z "$why" ] || $dry || rapid_die "policy: $why"
+  export RAPID_CONF_REV="$dev_tip"
+  wt=$(rapid_tmpdir release)
+  git worktree add -q --detach "$wt" "$dev_tip" >/dev/null 2>&1 || rapid_die "cannot make a private work tree under ${TMPDIR:-/tmp}; dev unchanged"
+  # the release gate is long: it is announced, then followed live on stderr
+  g=$(rapid_conf gates_release "")
+  [ -z "${RAPID_VERBOSE:-}" ] || [ -z "$g" ] || [ "$g" = none ] || printf -- '-> release gate on %s %s\n' "$v" "$(git rev-parse --short "$dev_tip")" >&2
+  if ! g=$(rapid_gate release "$wt" ${RAPID_VERBOSE:+live}); then
+    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rapid_die "release gate fails on $v; main and tags are unchanged${why:+; the release itself would be refused too: $why}"
+  fi
+  # release identity: what ships is the artifact built here, on the released tree, and gated
+  local adir="" manifest="" gates="release=$g"
+  if [ -n "$(rapid_conf release_build "")" ]; then
+    adir="$(cd "$(git rev-parse --git-common-dir)" && pwd)/rapid-artifacts/$v"
+    gates="$gates artifact=$(sed -n 's/^#gate //p' <<<"$manifest")"
+    manifest=$(grep '^Artifact: ' <<<"$manifest")
+  fi
+  git worktree remove --force "$wt" >/dev/null 2>&1 || true
+  # signed=required: the release tag is signed, and its signer must be one who may release (as pre-push and I5 check)
+  if $dry && [ -n "$why" ]; then
+    rapid_info "dry run: release gate on $v, but the release itself would be refused: $why"; [ -z "$manifest" ] || rm -rf "$adir"; return 0
+  fi
+  if $dry; then
+    rapid_info "dry run: would release $v (gates $gates): $([ "$sign" = -s ] && echo 'signed ')tag release/$v, main $(git rev-parse --short "$main_old") takes the release merge of dev at $(git rev-parse --short "$dev_tip")"
+    [ -z "$manifest" ] || { printf '%s\n' "$manifest" | sed 's/^/  /'; rm -rf "$adir"; }
+    return 0
+  fi
+  git tag "$sign" "release/$v" -m "rapid release $v
+
+$(_open_branches_report "$dev_tip")
+
+Gates: $gates
+Tested-Tree: $(git rev-parse "$dev_tip^{tree}")
+Released-By: $ce${manifest:+
+$manifest}" "$dev_tip" || rapid_die "could not make the release tag$([ "$sign" = -s ] && echo ' (signed=required: git tag -s needs your signing key, user.signingkey)'); main and tags are unchanged"
+  if [ -n "$why" ]; then git tag -d "release/$v" >/dev/null; rapid_die "policy: $why; main and tags are unchanged"; fi
+  # main takes dev by a --no-ff release merge, so main's first-parent line is the list of releases
+  local rmsg rmc
+  rmsg=$(mktemp "${TMPDIR:-/tmp}/rapid-release.XXXXXX")
+  {
+    printf '[MERGE] dev into main: %s\n\nPromotes dev at %s to production, by the owner.\n\n- Branches landed since the last release, oldest first:\n' "$v" "$v"
+    git log --first-parent --reverse --format=%s "$rel_old..$dev_tip" \
+      | sed -nE 's/^\[MERGE\] pool\/[^ \/]+\/([^ .]+[.])?([a-z]+)[.]([a-z0-9-]+) into dev: (v[0-9.]+)$/    - \4 \2\/\3/p'
+    printf '\nRelease: release/%s\nReleased-By: %s\n' "$v" "$ce"
+  } > "$rmsg"
+  local repo
+  if [ -n "$repo" ]; then
+    # main's ruleset requires a pull request: the forge writes the release merge, through a PR of dev
+    rm -f "$rmsg"
+    if ! git push -q origin "refs/tags/release/$v"; then
+      rapid_die "main took the release merge $(git rev-parse --short "$rmc") but the release tag push failed; rerun rapid release $v, which pushes the tag of a merged release"
+    fi
+  else
+    rmc=$(git commit-tree "$dev_tip^{tree}" -p "$main_old" -p "$dev_tip" -F "$rmsg")
+    rm -f "$rmsg"
+    if rapid_has_remote; then
+      if ! git push -q --atomic origin "$rmc:refs/heads/main" "refs/tags/release/$v"; then
+        git tag -d "release/$v" >/dev/null
+        rapid_die "origin refused the release push; main and tags are unchanged here and on origin"
+      fi
+    fi
+  fi
+  _move_branch main "$rmc" "$main_old"
+  rapid_info "released $v (release gate $g): main at the release merge $(git rev-parse --short "$rmc") of dev $(git rev-parse --short "$dev_tip")$(rapid_has_remote && echo ', pushed'); the next land opens a new series"
+}
+
+# _release_merge_ok M MAIN_OLD DEV_TIP V: 0 when M is the release merge of
+# DEV_TIP on MAIN_OLD: parents exactly MAIN_OLD then DEV_TIP, DEV_TIP's tree,
+# the release subject. Prints what differs.
+_release_merge_ok() {
+  local m="$1" ok=0
+  [ "$(git rev-list --parents -n1 "$m")" = "$m $2 $3" ] || { echo "  $(git rev-parse --short "$m") does not have parents main $(git rev-parse --short "$2") and dev $(git rev-parse --short "$3")" >&2; ok=1; }
+  [ "$(git rev-parse "$m^{tree}")" = "$(git rev-parse "$3^{tree}")" ] || { echo "  its tree is not dev's tree" >&2; ok=1; }
+  [ "$(git log -1 --format=%s "$m")" = "[MERGE] dev into main: $4" ] || { echo "  its subject is not '[MERGE] dev into main: $4'" >&2; ok=1; }
+  return "$ok"
+}
+
+# _release_tag_resume V DEV_TIP MAIN: a release whose merge is on main but
+# whose tag push failed: tag DEV_TIP and push the tag.
+_release_tag_resume() {
+  local v="$1" d="$2" m="$3"
+  if ! git rev-parse -q --verify "refs/tags/release/$v" >/dev/null; then
+    rapid_die "release/$v was made by the release that merged $(git rev-parse --short "$m"); it is not in this clone: fetch it from the clone that released (git fetch <that clone> tag release/$v)"
+  fi
+  git push -q origin "refs/tags/release/$v" || rapid_die "pushing release/$v failed again; retry when origin is back"
+  rapid_info "released $v: pushed the release tag of the merge $(git rev-parse --short "$m") already on main"
+}
+
 # ---------------------------------------------------------------- status
 cmd_status() {
   local root b v rel l ahead behind json=false sep="" oa="" ob=""
@@ -2090,6 +2270,7 @@ case "${1:-}" in
   check) shift; cmd_check "$@" ;;
   land) shift; cmd_land "$@" ;;
   sync) shift; cmd_sync "$@" ;;
+  release) shift; cmd_release "$@" ;;
   status) shift; cmd_status "$@" ;;
   doctor) shift; cmd_doctor "$@" ;;
   -h|--help) usage 0 ;;

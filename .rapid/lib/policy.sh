@@ -65,6 +65,40 @@ rapid_policy_may_land() {
   esac
 }
 
+# rapid_policy_may_release MAIN DEV EMAIL...: 0 when every EMAIL may promote
+# dev to main, else prints why. main is production: release_who,
+# release_list and the admins (.rapid/admins, the owner's file) are read as
+# committed at MAIN (main's tip, or for a push the main it moves from), so a
+# branch landed on dev never grants itself the right. While MAIN lists no admin
+# (a repository not yet released under this rule) the admins at DEV rule; rapid
+# setup writes its human runner, or the one --owner names, as the first admin
+# in the root commit, so a new repository starts with one.
+rapid_policy_may_release() {
+  local main="$1" dev="$2" who list e
+  shift 2
+  who=$(RAPID_CONF_REV="$main" rapid_conf release_who owner)
+  case "$who" in
+    owner)
+      list=$(RAPID_CONF_REV="$main" rapid_admins | tr '\n' ',')
+      [ -n "$list" ] || list=$(RAPID_CONF_REV="$dev" rapid_admins | tr '\n' ',')
+      if [ -z "$list" ]; then
+        [ -z "${RAPID_ADMINS_NONE_OK:-}" ] || return 0
+        echo "main is production and no admin is listed in .rapid/admins; rapid setup --owner EMAIL names the owner"; return 1
+      fi ;;
+    list)
+      list=$(RAPID_CONF_REV="$main" rapid_conf release_list "")
+      if [ -z "$list" ]; then echo "main is production and release_list is empty at main (release_who=list); an admin sets it"; return 1; fi ;;
+    *) echo "release_who='$who' is not owner or list"; return 1 ;;
+  esac
+  list="${list%,}"
+  for e in "$@"; do
+    if [ -z "$e" ] || ! tr ',' '\n' <<<"$list" | grep -Fx -- "$e" >/dev/null; then
+      echo "main is production; only $list promotes dev to main ('${e:-<no identity>}' may not)"; return 1
+    fi
+  done
+  return 0
+}
+
 # rapid_agent_session: prints the variable that marks this process as an AI
 # agent session and returns 0, or returns 1. Claude Code sets CLAUDECODE and
 # CLAUDE_CODE_ENTRYPOINT; conf agent_env names more (variable

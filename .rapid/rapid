@@ -592,6 +592,7 @@ cmd_branch() {
   done
   rapid_kind_ok "$kind" || RAPID_RC=2 rapid_die "kind '$kind' is not one of: $RAPID_KINDS"
   rapid_slug_ok "$slug" || RAPID_RC=2 rapid_die "name '$slug' must be a-z, 0-9 and -, 2 to 48 chars"
+  [ -z "$ticket" ] || rapid_ticket_ok "$ticket" || RAPID_RC=2 rapid_die "ticket '$ticket' must look like CODE-123"
   root=$(rapid_root); cd "$root"
   git rev-parse -q --verify refs/heads/dev >/dev/null || rapid_die "no dev branch; run 'rapid setup'"
   [ -z "$(git status --porcelain --untracked-files=no)" ] || rapid_die "the work tree has uncommitted changes; commit or stash them first"

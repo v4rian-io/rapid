@@ -1,3 +1,22 @@
+# shellcheck shell=bash
+# tracker.sh - one contract for any ticket tracker.
+#
+# The tracker comes from operator settings first: $RAPID_TRACKER, then git
+# config rapid.tracker; the committed .rapid/conf key tracker may only say none.
+# A command tracker runs an executable, so a branch can never pick one by
+# committing it: command:<path> is honoured only from operator settings, and
+# never when the path is a file the repository tracks.
+#
+# Values: none (default), command:<path> (absolute, or relative to the root).
+# Adapter contract: <adapter> <op> [args], one JSON object on stdout, exit 0.
+#   get <ID>                              {"key": "<ID>", "title": "...", ...}
+#   link <ID> --branch <branch>             {"ok": true}
+#   transition <ID> --to done --ref <v>   {"ok": true}
+# Ticket ids look like CODE-123. A failed link or transition is reported and
+# never undoes a branch or a land.
+
+rapid_ticket_ok() { [[ "$1" =~ ^[A-Z][A-Z0-9]*-[0-9]+$ ]]; }
+
 # rapid_tracker: the adapter path, empty for none.
 rapid_tracker() {
   local v src=operator p root
@@ -18,6 +37,7 @@ rapid_tracker() {
     *) RAPID_RC=2 rapid_die "tracker '$v' is not none or command:<path>" ;;
   esac
 }
+
 # rapid_tracker_call OP ARGS...: run the adapter (if any); print its JSON object.
 rapid_tracker_call() {
   local a out
@@ -27,5 +47,6 @@ rapid_tracker_call() {
   case "$out" in "{"*"}") ;; *) rapid_warn "tracker $1 did not answer one JSON object"; return 1 ;; esac
   printf '%s' "$out"
 }
+
 # rapid_json_str JSON KEY: one top-level string field (no nesting needed here).
 rapid_json_str() { sed -nE 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"(([^"\\]|\\.)*)".*/\1/p' <<<"$1" | sed -n 1p; }

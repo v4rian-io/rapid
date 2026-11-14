@@ -83,6 +83,7 @@
 #   rapid doctor --history-only          invariants I1 to I9 only (CI: no hooks on the runner);
 #                                      the merges are checked at once, one worker per core (RAPID_HISTORY_JOBS)
 #   rapid doctor --verify [SINCE]         run again, on the own tree of each merge, what its test record names (after SINCE)
+#   rapid doctor --deep [DOCTOR FLAGS]   the doctor, then the repository's own scenarios (.rapid/tests/run.sh): minutes
 #   rapid hook NAME [ARGS...]            run rapid's own hook NAME (commit-msg, pre-commit, pre-push, prepare-commit-msg)
 #                                      for this repository: what the hook stubs of an installed repository call
 #   rapid upgrade [VERSION]              on a branch: fetch the tags of the installed rapid and pin VERSION, by default
@@ -2913,6 +2914,7 @@ _agent_guard_installed() { [ -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/rapid
 cmd_doctor() {
   # --verbose, wherever it stands: the walk prints its progress lines
   local va vrest=(); for va in "$@"; do if [ "$va" = --verbose ]; then export RAPID_VERBOSE=1; else vrest+=("$va"); fi; done; set -- ${vrest[@]+"${vrest[@]}"}
+  if [ "${1:-}" = "--deep" ]; then shift; _doctor_deep "$@"; return; fi
   local history=false all=false root bad=0 hp out k email ck rec=false
   [ "${1:-}" = "--history" ] && history=true
   if [ "${2:-}" = "--since" ]; then [ -n "${3:-}" ] || RAPID_RC=2 rapid_die "--since needs a revision"; export RAPID_HISTORY_SINCE="$3"; fi
@@ -3279,6 +3281,34 @@ Notify:$mentions"
   fi
   gh pr close "$n" --repo "$repo" --comment "$body" >/dev/null || rapid_die "closing PR #$n on $repo failed; nothing changed"
   rapid_info "PR #$n on $repo is rejected; $branch and its safety anchor are kept"
+}
+
+# ==== doctor --deep
+# _doctor_deep [DOCTOR ARGS]: rapid doctor --deep. The doctor itself (with
+# the arguments that follow --deep), then the framework's own scenarios
+# (.rapid/tests/run.sh) run from this install: is the install working, not
+# only complete. Each failed scenario is named and the counts line printed.
+# Exit 1 when the doctor or a scenario fails, or when this install carries
+# no scenarios (they cannot answer then). It takes minutes; nothing in the
+# repository changes (each scenario works in its own temp directory).
+_doctor_deep() {
+  # the scenarios are the repository's own (.rapid/tests/run.sh), never those of the rapid that serves it
+  local rc=0 run out
+  run="$(git rev-parse --show-toplevel 2>/dev/null || pwd)/.rapid/tests/run.sh"
+  ( cmd_doctor "$@" ) || rc=1
+  if [ ! -f "$run" ]; then
+    rapid_info "doctor: deep: .rapid/tests/run.sh is not in this install, so its scenarios cannot run"
+    return 1
+  fi
+  rapid_info "doctor: deep: running the scenarios of this install (.rapid/tests/run.sh); this takes minutes"
+  if out=$(bash "$run" 2>/dev/null); then
+    rapid_info "doctor: deep: ok ($(tail -n 1 <<<"$out" | sed -E 's/^-+ //'))"
+  else
+    grep -E '^FAIL ' <<<"$out" | sed 's/^/doctor: deep: /' || true
+    rapid_info "doctor: deep: failed ($(tail -n 1 <<<"$out" | sed -E 's/^-+ //')); this install does not behave as its scenarios say"
+    rc=1
+  fi
+  return "$rc"
 }
 
 # A clone that never ran rapid setup has no hooks and maybe no dev: the verbs

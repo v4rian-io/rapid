@@ -1,3 +1,12 @@
 rapid land feature/setup as v2026.0.4: merge tree 261841d80cac0b782f71e01cd1fb0a2aaadd8e0e
 
 gates deferred to the close of batch 5d06fa1: no gate ran on this merge tree at the land
+
+close of batch 5d06fa1: gate each on this merge tree 261841d80cac0b782f71e01cd1fb0a2aaadd8e0e
+
+gate=each
+command=sh .rapid/tests/smoke.sh
+exit=0
+duration=1s
+at=2026-11-17T14:41:46Z
+--- log tail

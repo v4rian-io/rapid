@@ -1,3 +1,12 @@
 rapid land feature/bisect as v2026.0.34: merge tree 62664b653de6e8dad2bc9d838b2cf58a1734a033
 
 gates deferred to the close of batch 5d06fa1: no gate ran on this merge tree at the land
+
+close of batch 5d06fa1: gate each on this merge tree 62664b653de6e8dad2bc9d838b2cf58a1734a033
+
+gate=each
+command=sh .rapid/tests/smoke.sh
+exit=0
+duration=3s
+at=2026-11-17T14:41:48Z
+--- log tail

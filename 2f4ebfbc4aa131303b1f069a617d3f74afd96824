@@ -1,3 +1,12 @@
 rapid land docs/license as v2026.0.45: merge tree 56d3b512fce05b045c2e4bbf8f4a7ed5e024dbe0
 
 gates deferred to the close of batch 5d06fa1: no gate ran on this merge tree at the land
+
+close of batch 5d06fa1: gate each on this merge tree 56d3b512fce05b045c2e4bbf8f4a7ed5e024dbe0
+
+gate=each
+command=sh .rapid/tests/smoke.sh
+exit=0
+duration=7s
+at=2026-11-17T14:41:52Z
+--- log tail

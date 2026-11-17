@@ -1,3 +1,12 @@
 rapid land feature/release-artifacts as v2026.0.31: merge tree 5e66c8ef897352b6568407cc326ee9814db9c3f2
 
 gates deferred to the close of batch 5d06fa1: no gate ran on this merge tree at the land
+
+close of batch 5d06fa1: gate each on this merge tree 5e66c8ef897352b6568407cc326ee9814db9c3f2
+
+gate=each
+command=sh .rapid/tests/smoke.sh
+exit=0
+duration=3s
+at=2026-11-17T14:41:48Z
+--- log tail

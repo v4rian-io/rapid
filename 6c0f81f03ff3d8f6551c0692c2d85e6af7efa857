@@ -1,3 +1,12 @@
 rapid land feature/history-reports as v2026.0.32: merge tree 21463def3945f28847e2f4aadee4b6c7b31557dc
 
 gates deferred to the close of batch 5d06fa1: no gate ran on this merge tree at the land
+
+close of batch 5d06fa1: gate each on this merge tree 21463def3945f28847e2f4aadee4b6c7b31557dc
+
+gate=each
+command=sh .rapid/tests/smoke.sh
+exit=0
+duration=3s
+at=2026-11-17T14:41:48Z
+--- log tail

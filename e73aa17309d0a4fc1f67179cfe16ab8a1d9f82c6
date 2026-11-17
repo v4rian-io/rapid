@@ -1,3 +1,12 @@
 rapid land feature/land-refusals as v2026.0.40: merge tree f2108abaab36390bc63f877cd60500c7bbd1f6b6
 
 gates deferred to the close of batch 5d06fa1: no gate ran on this merge tree at the land
+
+close of batch 5d06fa1: gate each on this merge tree f2108abaab36390bc63f877cd60500c7bbd1f6b6
+
+gate=each
+command=sh .rapid/tests/smoke.sh
+exit=0
+duration=7s
+at=2026-11-17T14:41:52Z
+--- log tail

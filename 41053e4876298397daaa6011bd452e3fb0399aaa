@@ -1,3 +1,12 @@
 rapid land feature/install-symlink as v2026.0.30: merge tree f51a77f8b7b0064e5300ff7e6c075e60def309ba
 
 gates deferred to the close of batch 5d06fa1: no gate ran on this merge tree at the land
+
+close of batch 5d06fa1: gate each on this merge tree f51a77f8b7b0064e5300ff7e6c075e60def309ba
+
+gate=each
+command=sh .rapid/tests/smoke.sh
+exit=0
+duration=3s
+at=2026-11-17T14:41:48Z
+--- log tail

@@ -10,3 +10,37 @@ exit=0
 duration=9s
 at=2026-11-17T14:41:54Z
 --- log tail
+
+close of batch 5d06fa1: gates on the final tree e0b6ee3f050e1c2c8b56d22ec07d6f8cdad4a061
+
+gate=full
+command=sh .rapid/lint/run.sh && sh .rapid/tests/run.sh
+exit=0
+duration=453s
+at=2026-11-17T14:49:29Z
+--- log tail
+PASS  setup-main                         413s
+PASS  setup-owner                        263s
+PASS  setup                              129s
+PASS  shipped-in                         271s
+PASS  signed-release                     346s
+PASS  signed                             359s
+PASS  skill-lenses                        19s
+PASS  smart-commit                       154s
+PASS  smoke-lints                        336s
+PASS  stacked                            175s
+PASS  stale-branch                       173s
+PASS  stale-dev-checkout                 367s
+PASS  state-closed                       229s
+PASS  sync-conflict                      181s
+PASS  sync-push                          270s
+PASS  tracker-adapters                   270s
+PASS  tracker                            245s
+PASS  unmarked-red                       170s
+PASS  upgrade                            155s
+PASS  vault                              240s
+PASS  verify-incoming-dev                257s
+PASS  version-math                        19s
+PASS  version-pin                         31s
+PASS  version-report                      25s
+---- 115 passed, 0 failed in 449s (108 at once)

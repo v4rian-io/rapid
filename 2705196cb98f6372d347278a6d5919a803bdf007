@@ -1,3 +1,12 @@
 rapid land test/live-canary as v2026.0.42: merge tree 97d35e3c63960141720d76bfb8c99b48a17da024
 
 gates deferred to the close of batch 5d06fa1: no gate ran on this merge tree at the land
+
+close of batch 5d06fa1: gate each on this merge tree 97d35e3c63960141720d76bfb8c99b48a17da024
+
+gate=each
+command=sh .rapid/tests/smoke.sh
+exit=0
+duration=7s
+at=2026-11-17T14:41:52Z
+--- log tail
